@@ -1,0 +1,8 @@
+data/
+backups/
+config/
+secrets/
+*.bak*
+node_modules/
+*.db
+*.log

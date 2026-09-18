@@ -1,0 +1,10 @@
+.git
+data
+backups
+config
+secrets
+**/*.bak*
+unraid
+*.md
+icon.png
+make-icon.mjs
