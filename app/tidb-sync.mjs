@@ -38,6 +38,8 @@ const CFG = {
     // Deliberately outside the claude workspace — never put the key in this directory.
     keyFile: process.env.TIDB_API_KEY_FILE || '/mnt/cache/appdata/tidb-sync/api_key',
     backupDir: process.env.TIDB_BACKUP_DIR || '/mnt/cache/appdata/tidb-sync/backups',
+    // fingerprint.mjs's store: detections from the "fingerprint" source (method 4), read-only here
+    fpDb: process.env.FP_DB || path.join(process.env.TIDB_DATA_DIR || path.join(HERE, 'data'), 'fingerprints.db'),
     api: 'https://api.theintrodb.org/v3',
 };
 
@@ -77,6 +79,7 @@ const planOpts = () => ({
     mapPreview: !flag('no-preview'),        // preview -> credits marker (skipping it lands on Up Next)
     useChapters: !flag('no-chapters'),      // the file's own named chapters (Intro / Credits / Recap ...)
     useIntrodb: !flag('no-introdb'),        // introdb.app fills segment types the others lack
+    useFingerprint: !flag('no-fingerprint'), // our own audio/video detection (fingerprint.mjs), last resort
     palGuard: !flag('no-pal-guard'),        // ignore community timestamps on PAL speed-up files (see buildPlan)
 });
 
@@ -391,7 +394,7 @@ function desiredMarkers(b, dur, { mapRecap, mapPreview }) {
 }
 
 // m.src is e.g. "tidb:intro", "chapters:credits", or "tidb:credits+introdb:credits" after a merge.
-const SOURCE_NAMES = ['tidb', 'chapters', 'introdb'];
+const SOURCE_NAMES = ['tidb', 'chapters', 'introdb', 'fingerprint'];
 const sourceOf = (src = '') => {
     const s = SOURCE_NAMES.filter(k => src.includes(`${k}:`));
     return s.length > 1 ? 'mixed' : s[0] ?? 'tidb';
@@ -435,7 +438,8 @@ const sameSet = (a, b, tol = 0) => a.length === b.length && a.every((m, i) =>
 // Per segment type, the first source that has it wins: TheIntroDB (community-verified, cut-aware),
 // then the file's own named chapters, then introdb.app (rows go live unverified, can't pick a cut).
 // introdb.app's "outro" = end credits; its "post_credits" is a scene to watch, so it's never mapped.
-function mergeSources(tb, cb, ib, { useChapters, useIntrodb }) {
+// Last: our own detection (fingerprint.mjs), which only runs where none of the above has the segment type anyway.
+function mergeSources(tb, cb, ib, fb, { useChapters, useIntrodb, useFingerprint }) {
     const b = { from: {} };
     const take = (k, v, src) => { if (!b[k] && v?.length) { b[k] = v; b.from[k] = src; } };
     for (const k of ['intro', 'recap', 'credits', 'preview']) take(k, tb?.[k], 'tidb');
@@ -445,7 +449,30 @@ function mergeSources(tb, cb, ib, { useChapters, useIntrodb }) {
             if (v?.end_ms > 0) take(k, [{ start_ms: v.start_ms, end_ms: v.end_ms }], 'introdb');
         }
     }
+    if (useFingerprint && fb) for (const k of ['intro', 'credits']) take(k, fb[k], 'fingerprint');
     return b;
+}
+
+// Detections from fingerprint.mjs, only where they were made on the file Plex has NOW (same path + size): a replaced
+// or upgraded file gets detected again rather than inheriting another release's timings.
+function fingerprintBodies(plex) {
+    const out = new Map();
+    if (!fs.existsSync(CFG.fpDb)) return out;
+    let db;
+    try { db = new DatabaseSync(CFG.fpDb, { readOnly: true }); db.exec('PRAGMA busy_timeout=15000'); }
+    catch (e) { log(`fingerprint store unreadable (${e.message}); ignoring it`); return out; }
+    const rows = db.prepare(`SELECT mid, kind, file, size, start_ms, end_ms FROM detections
+                             WHERE status IN ('match', 'found') AND start_ms IS NOT NULL AND end_ms > start_ms`).all();
+    db.close();
+    const part = plex.prepare(`SELECT mp.file, mp.size FROM media_items mi JOIN media_parts mp ON mp.media_item_id = mi.id
+                               WHERE mi.metadata_item_id = ? AND mi.deleted_at IS NULL AND mp.deleted_at IS NULL`);
+    for (const r of rows) {
+        const parts = part.all(r.mid);
+        if (parts.length !== 1 || parts[0].file !== r.file || parts[0].size !== r.size) continue;
+        if (!out.has(r.mid)) out.set(r.mid, {});
+        out.get(r.mid)[r.kind] = [{ start_ms: r.start_ms, end_ms: r.end_ms }];
+    }
+    return out;
 }
 
 function buildPlan(L, plex, opts) {
@@ -497,24 +524,28 @@ function buildPlan(L, plex, opts) {
             if (Array.isArray(ch) && ch.length > 1) chaptersBy.set(r.mid, { ch, dur: r.dur });
         }
     }
+    // Our own detections are measured on this exact file (PAL speed included), so the PAL guard doesn't apply to them.
+    const fpBy = opts.useFingerprint ? fingerprintBodies(plex) : new Map();
     const stats = { withData: 0, gone: 0, noUsable: 0, add: 0, reapply: 0, update: 0, replacePlex: 0,
                     keptPlex: 0, alreadyCurrent: 0, droppedOverlap: 0, markers: { intro: 0, credits: 0 },
-                    bySource: { tidb: 0, chapters: 0, introdb: 0, mixed: 0 }, retract: 0, spedUpFiles: spedUp.size, palIgnored: 0 };
+                    bySource: { tidb: 0, chapters: 0, introdb: 0, fingerprint: 0, mixed: 0 }, retract: 0, spedUpFiles: spedUp.size, palIgnored: 0,
+                    fingerprintDetections: fpBy.size };
     const plan = [];
 
     for (const r of rows) {
         const ch = chaptersBy.get(r.mid);
+        const fb = fpBy.get(r.mid) ?? null;
         const sped = spedUp.has(r.mid);
         if (sped && (r.tbody || r.ibody)) stats.palIgnored++;
         const tbody = sped ? null : r.tbody, ibody = sped ? null : r.ibody;
         const mayRetract = sped && oursMids.has(r.mid);
-        if (!tbody && !(opts.useIntrodb && ibody) && !ch && !mayRetract) continue;
+        if (!tbody && !(opts.useIntrodb && ibody) && !ch && !fb && !mayRetract) continue;
         stats.withData++;
         const lv = live.get(r.mid);
         if (!lv) { stats.gone++; continue; }
         const dur = lv.duration || 0;
         const merged = mergeSources(tbody && JSON.parse(tbody), ch && chapterSegments(ch.ch, dur, r.kind),
-                                    ibody && JSON.parse(ibody), opts);
+                                    ibody && JSON.parse(ibody), fb, opts);
         const want = desiredMarkers(merged, dur, opts);
         if (!want.intro.length && !want.credits.length && !mayRetract) { stats.noUsable++; continue; }
         const existing = existingBy.get(r.mid) ?? [];
@@ -1019,7 +1050,7 @@ function sourcesCmd() {
     for (const m of marks) {
         const key = `${m.mid}|${m.text}|${m.start}|${m.end}`;
         const src = ours.has(key) ? sourceOf(ours.get(key) ?? 'tidb:') : 'plex';
-        table[m.text] ??= { plex: 0, tidb: 0, chapters: 0, introdb: 0, mixed: 0 };
+        table[m.text] ??= { plex: 0, tidb: 0, chapters: 0, introdb: 0, fingerprint: 0, mixed: 0 };
         table[m.text][src]++;
     }
     const live = new Set(marks.map(m => `${m.mid}|${m.text}|${m.start}|${m.end}`));
@@ -1065,7 +1096,7 @@ function status() {
 const COMMANDS = { inventory, fetch: fetchCmd, plan: planCmd, selftest, status, sources: sourcesCmd,
                    apply: applyCmd, undo: undoCmd, submit: submitCmd, 'submit-introdb': submitIdbCmd };
 if (!COMMANDS[cmd]) {
-    console.log('usage: tidb-sync.mjs inventory | fetch [--source tidb|introdb] [--budget N] | plan [--policy fill|prefer-tidb] [--no-chapters] [--no-introdb]\n'
+    console.log('usage: tidb-sync.mjs inventory | fetch [--source tidb|introdb] [--budget N] | plan [--policy fill|prefer-tidb] [--no-chapters] [--no-introdb] [--no-fingerprint]\n'
         + '                     selftest | status | sources\n'
         + '                     apply --yes [--live] [--limit N] [--match TEXT] [--policy ...] [--no-recap] [--no-preview]\n'
         + '                     undo <file> --yes [--live]\n'

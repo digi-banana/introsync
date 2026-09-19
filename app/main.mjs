@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 // IntroSync container entrypoint. Once a day at RUN_AT (local time) it runs the tidb-sync.mjs stages
 //   inventory -> fetch tidb -> fetch introdb -> plan -> [selftest -> apply]   (apply only if APPLY_ENABLED)
-// (plan merges, per segment type: TheIntroDB, then the files' named chapters, then introdb.app)
-// each as a child process, and serves the web UI + /health on WEB_PORT.
+// (plan merges, per segment type: TheIntroDB, then the files' named chapters, then introdb.app, then our own
+// fingerprint detections) each as a child process, and serves the web UI + /health on WEB_PORT.
+// With FP_ENABLED, a separate worker runs fingerprint.mjs in hourly rounds (see "fingerprint worker").
 //
 // Run settings live in /data/settings.json and are edited on the Settings page (settings.mjs); the template's
-// old variables only seed that file on first start. Login (AUTH_*), port, folders and PLEX_URL stay in the template.
+// old variables only seed that file on first start. Login (AUTH_*), port and folders stay in the template.
 // Security model: login is optional (see "login" below). Changes (settings, keys, run, plan, apply, undo, submit)
 // are allowed from the local network, or from anywhere with login on, and ALWAYS need a per-process CSRF token and a
 // same-origin request.
@@ -44,7 +45,10 @@ const digest = (s) => createHash('sha256').update(s).digest();
 // Private / loopback / link-local addresses count as local. LAN clients keep their real address (Docker DNAT);
 // requests from the Unraid host arrive via the Docker gateway, also private. If the request was forwarded by a
 // proxy, every address it lists must be private too, so a proxied internet request is never treated as local.
-const PRIVATE = [/^10\./, /^192\.168\./, /^172\.(1[6-9]|2\d|3[01])\./, /^127\./, /^169\.254\./, /^::1$/, /^f[cd][0-9a-f]{2}:/i, /^fe[89ab][0-9a-f]:/i];
+// 100.64.0.0/10 (CGNAT) is Tailscale's range: the user chose to count their tailnet as local (2026-09-18). Tailscale's
+// IPv6 range (fd7a:115c:a1e0::/48) is already covered by the fc00::/7 entry.
+const PRIVATE = [/^10\./, /^192\.168\./, /^172\.(1[6-9]|2\d|3[01])\./, /^127\./, /^169\.254\./, /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./,
+                 /^::1$/, /^f[cd][0-9a-f]{2}:/i, /^fe[89ab][0-9a-f]:/i];
 const isPrivate = (ip) => { const a = String(ip ?? '').trim().replace(/^::ffff:/i, '').replace(/^\[|\]$/g, ''); return !!a && PRIVATE.some(r => r.test(a)); };
 function clientAddrs(req) {
     const addrs = [req.socket.remoteAddress];
@@ -77,8 +81,11 @@ const sameToken = (a) => typeof a === 'string' && a.length === CSRF.length && ti
 // API keys reach the tool as FILE PATHS only; values never pass through the environment or logs.
 function childEnv() {
     return { ...process.env,
+        PLEX_URL: S.get('PLEX_URL'),
+        FP_WEBDAV_URL: S.get('FP_WEBDAV_URL'), FP_WEBDAV_USER: S.get('FP_WEBDAV_USER'), FP_DECYPHARR_URL: S.get('FP_DECYPHARR_URL'),
         TIDB_API_KEY_FILE: S.secretIsSet('tidb_api_key') ? S.secretPath('tidb_api_key') : CONFIG_KEY,
-        INTRODB_API_KEY_FILE: S.secretPath('introdb_api_key') };
+        INTRODB_API_KEY_FILE: S.secretPath('introdb_api_key'),
+        INFINIDYSK_PASSWORD_FILE: S.secretPath('infinidysk_password') };
 }
 function tool(args, { quiet = false } = {}) {
     return new Promise((resolve) => {
@@ -102,6 +109,7 @@ function planArgs() {
     if (!S.get('CHAPTERS_ENABLED')) a.push('--no-chapters');
     if (!S.get('INTRODB_ENABLED')) a.push('--no-introdb');
     if (!S.get('PAL_GUARD')) a.push('--no-pal-guard');
+    if (!S.get('FP_ENABLED')) a.push('--no-fingerprint');
     return a;
 }
 const applySteps = () => [['selftest'], ['apply', '--yes', '--live', '--keep-backups', String(S.get('KEEP_BACKUPS')), ...planArgs()]];
@@ -164,6 +172,71 @@ function scheduleNext() {
     nextRunAt = next;
     schedTimer = setTimeout(() => { runChain('schedule'); scheduleNext(); }, next - new Date());
     log(`next run ${next.toString()}`);
+}
+
+// ---------- fingerprint worker (method 4) ----------
+// While FP_ENABLED is on, fingerprint.mjs runs in rounds of up to an hour, back to back, BESIDE the one-at-a-time lock:
+// it only reads Plex and the ledger and writes its own store (fingerprints.db); the daily chain's `plan` picks its
+// detections up. No download limit (Usenet is unlimited) and no pause for streams (only Plex DB writes wait for those,
+// and this never writes Plex's DB): both the user's calls, 2026-09-18.
+const FP_TOOL = '/app/fingerprint.mjs';
+const FP_DB = env('FP_DB', path.join(DATA, 'fingerprints.db'));
+const fp = { child: null, state: 'off', since: Date.now(), timer: null, last: null };
+// How long to wait before the next round, by why the last one stopped.
+const FP_NEXT = { time: 5_000, limit: 5_000, done: 6 * 3600_000 };
+function fpArgs() {
+    const a = ['detect', '--max-minutes', '60'];
+    if (!S.get('FP_CREDITS')) a.push('--no-credits');
+    if (!S.get('CHAPTERS_ENABLED')) a.push('--no-chapters');
+    if (!S.get('INTRODB_ENABLED')) a.push('--no-introdb');
+    if (!S.get('MAP_RECAP')) a.push('--no-recap');
+    if (!S.get('MAP_PREVIEW')) a.push('--no-preview');
+    return a;
+}
+const fpSet = (state) => { if (fp.state !== state) { fp.state = state; fp.since = Date.now(); } };
+function fpStart() {
+    clearTimeout(fp.timer); fp.timer = null;
+    if (fp.child) return;
+    if (!S.get('FP_ENABLED')) return fpSet('off');
+    if (!S.secretIsSet('infinidysk_password')) return fpSet('no-password');
+    fpSet('running');
+    const p = spawn('node', [FP_TOOL, ...fpArgs()], { stdio: ['ignore', 'pipe', 'pipe'], env: childEnv() });
+    fp.child = p;
+    let out = '';
+    const keep = (b) => { out = (out + b).slice(-200_000); process.stdout.write(b); };
+    p.stdout.on('data', keep);
+    p.stderr.on('data', keep);
+    p.on('exit', (code) => {
+        fp.child = null;
+        const sum = lastJson(out);
+        fp.last = { at: Math.floor(Date.now() / 1000), code, ...(sum ?? {}) };
+        invalidate();
+        if (!S.get('FP_ENABLED')) return fpSet('off');
+        const why = sum?.stopped ?? 'error';
+        if (why === 'no-password' || why === 'bad-password') return fpSet(why);   // until the password changes
+        fpSet(why === 'time' || why === 'limit' ? 'running' : why === 'done' ? 'idle' : why);
+        fp.timer = setTimeout(fpStart, FP_NEXT[why] ?? 30 * 60_000);
+    });
+}
+function fpStop() {
+    clearTimeout(fp.timer); fp.timer = null;
+    if (fp.child) fp.child.kill('SIGTERM');
+    fpSet('off');
+}
+function fpStatus() {
+    const st = { state: fp.state, since: fp.since, last: fp.last, enabled: S.get('FP_ENABLED') };
+    const db = fs.existsSync(FP_DB) ? ro(FP_DB) : null;
+    if (!db) return st;
+    try {
+        st.detections = db.prepare('SELECT kind, status, count(*) n FROM detections GROUP BY kind, status').all().map(r => ({ ...r }));
+        const rdCol = db.prepare('PRAGMA table_info(reads)').all().some(c => c.name === 'rd_bytes') ? 'rd_bytes' : '0';
+        st.today = { ...(db.prepare(`SELECT bytes, ${rdCol} rd_bytes, episodes FROM reads WHERE day = ?`).get(new Date().toISOString().slice(0, 10)) ?? { bytes: 0, rd_bytes: 0, episodes: 0 }) };
+        st.last7 = { ...db.prepare(`SELECT coalesce(sum(bytes), 0) bytes, coalesce(sum(${rdCol}), 0) rd_bytes, coalesce(sum(episodes), 0) episodes FROM reads WHERE day >= date('now', '-6 days')`).get() };
+        st.total = { ...db.prepare(`SELECT coalesce(sum(bytes), 0) bytes, coalesce(sum(${rdCol}), 0) rd_bytes, coalesce(sum(episodes), 0) episodes, min(day) since FROM reads`).get() };
+        st.refs = db.prepare('SELECT count(*) n FROM refs').get().n;
+        st.lastRun = JSON.parse(db.prepare("SELECT value FROM state WHERE key = 'lastRun'").get()?.value ?? 'null');
+    } catch (e) { st.error = e.message; } finally { db.close(); }
+    return st;
 }
 
 // ---------- data for the pages (read-only; cached) ----------
@@ -269,7 +342,7 @@ function runHistory(limit = 60) {
             const planned = Object.values(bySource).reduce((a, b) => a + b, 0);
             let src = bySource;
             if (planned !== (sm.done?.inserted ?? 0)) {
-                src = { tidb: 0, chapters: 0, introdb: 0, mixed: 0 };
+                src = { tidb: 0, chapters: 0, introdb: 0, fingerprint: 0, mixed: 0 };
                 for (const a of appliedRows) if (a.t >= r.s - 5 && a.t <= r.f + 5) src[srcCat(a.source)] = (src[srcCat(a.source)] ?? 0) + 1;
             }
             cur.apply = { ...(sm.done ?? {}), bySource: src, retract: sm.stats?.retract ?? 0 };
@@ -378,7 +451,7 @@ async function ctx(url, req) {
     const snap = await snapshot();
     const m = url.searchParams.get('m');
     return {
-        authOn: canWrite(req), csrf: CSRF, running, nextRunAt, snap, settings: S.all(),
+        authOn: canWrite(req), csrf: CSRF, running, nextRunAt, snap, settings: S.all(), fp: fpStatus(),
         secrets: Object.fromEntries(Object.keys(S.SECRETS).map(k => [k, S.secretIsSet(k)])),
         configKey: (() => { try { return fs.statSync(CONFIG_KEY).size > 0; } catch { return false; } })(),
         flash: m ? { msg: m.slice(0, 300), err: url.searchParams.get('e') === '1' } : null,
@@ -388,7 +461,7 @@ async function ctx(url, req) {
 async function handle(req, res) {
     const url = new URL(req.url, 'http://x');
     const p = url.pathname;
-    if (p === '/health') return send(res, 200, JSON.stringify({ ok: true, running, nextRunAt }), 'application/json');
+    if (p === '/health') return send(res, 200, JSON.stringify({ ok: true, running, nextRunAt, fingerprint: fp.state }), 'application/json');
     if (!authorized(req)) {
         return send(res, 401, env('AUTH_USERNAME', '') && env('AUTH_PASSWORD', '') ? 'login required' : 'AUTH_ENABLED=true but no username/password set',
                     'text/plain', { 'WWW-Authenticate': 'Basic realm="IntroSync", charset="UTF-8"' });
@@ -429,6 +502,8 @@ async function handle(req, res) {
         try {
             const changed = S.update(form);
             if (changed.includes('RUN_AT')) scheduleNext();
+            // Fingerprint on/off applies now; its other options apply from its next round (within the hour).
+            if (changed.includes('FP_ENABLED')) { if (S.get('FP_ENABLED')) fpStart(); else fpStop(); }
             invalidate();
             log(`settings changed: ${changed.join(', ') || '(none)'}`);
             return redirect(res, '/settings', changed.length ? `Saved: ${changed.map(k => S.SCHEMA.find(s => s.key === k).label).join(', ')}.` : 'No changes.');
@@ -438,6 +513,7 @@ async function handle(req, res) {
         try {
             const r = S.setSecret(form.name, form.clear ? '' : form.value);
             log(`secret ${form.name} ${r}`);             // never the value
+            if (form.name === 'infinidysk_password' && S.get('FP_ENABLED') && !fp.child) fpStart();
             invalidate();
             return redirect(res, '/settings', `${S.SECRETS[form.name].label} ${r}.`);
         } catch (e) { return redirect(res, '/settings', e.message, true); }
@@ -470,8 +546,9 @@ createServer((req, res) => {
     handle(req, res).catch((e) => { log('request failed:', e.stack || e.message); if (!res.headersSent) send(res, 500, 'internal error', 'text/plain'); });
 }).listen(PORT, () => log(`web UI on :${PORT} (login ${AUTH ? `on${AUTH_LOCAL ? ', including the local network' : ' outside the local network'}` : 'off; changes allowed from the local network'})`));
 
-for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { log(`${sig}: exiting`); process.exit(0); });
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { log(`${sig}: exiting`); fp.child?.kill('SIGTERM'); process.exit(0); });
 
 scheduleNext();
 setTimeout(refreshSubs, 20_000);
 if (S.get('RUN_ON_START')) setTimeout(() => runChain('start'), 15_000);
+setTimeout(fpStart, 30_000);

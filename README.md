@@ -12,9 +12,12 @@ InfiniDysk (NNTP) and Decypharr (RD) streaming mounts.
      `CHAPTERS_ENABLED=true`. Movies take credits only, because a film's opening-credits chapter
      often runs over story.
   3. [introdb.app](https://introdb.app): IMDb-keyed and unverified. Fills whatever the others lack.
+  4. **Fingerprint detection** (`FP_ENABLED`, off by default): IntroSync's own detection on episodes none of the
+     above covers, from a few seconds of each file matched against a season sibling whose intro is known. See
+     "Fingerprint detection" below.
 - **Provenance:** every marker IntroSync writes records its source in the ledger. The `sources`
   stage (and the status page) reports every marker in Plex as `plex` (Plex's own detection),
-  `tidb`, `chapters`, `introdb`, or `mixed` (when merged segments came from different sources).
+  `tidb`, `chapters`, `introdb`, `fingerprint`, or `mixed` (when merged segments came from different sources).
 - **Status (2026-09-18):** running with `APPLY_ENABLED=true`.
   - Trial (The Last of Us, 22 markers) confirmed by the user in a client.
   - First full run: 770 markers. A later run added 165 (4 of IntroSync's own rewritten).
@@ -24,7 +27,9 @@ InfiniDysk (NNTP) and Decypharr (RD) streaming mounts.
 | path | what |
 |---|---|
 | `app/tidb-sync.mjs` | the tool (all stages); **canonical copy** |
-| `app/main.mjs` | container entrypoint: daily scheduler + status page on :8897 |
+| `app/main.mjs` | container entrypoint: daily scheduler + status page on :8897 + fingerprint worker |
+| `app/fingerprint.mjs`, `app/detector.mjs` | fingerprint source (method 4): orchestration + store / detection engine |
+| `data/fingerprints.db` | fingerprint store: saved references, sibling calibrations, detections, bytes read per day |
 | `data/tidb.db` | ledger: items, lookups (TIDB rows `t:`/`m:`, introdb.app rows `idb:`), applied (+source), submissions, runs |
 | `data/plan-*.json`, `data/undo-*.jsonl` | plans; one undo log per apply |
 | `config/api_key` | TheIntroDB API key (99:100, 600). Never copy it into the claude workspace. |
@@ -163,12 +168,13 @@ Pages: **Status** (lookups: last request, rolling 24 h, TheIntroDB limit warning
 (show → season → episode markers with source badges; filters), **Plan & apply**, **Runs & undo**, **Submit**, **Settings**.
 - **Settings live in `/data/settings.json`** (mode 600), edited on the Settings page. The template's old run variables
   seeded it once and were then removed from the template; the file wins over the environment. Login (`AUTH_*`),
-  port, folders, `PLEX_URL` and `TZ` stay in the template (a settings page can't safely change its own login).
+  port, folders and `TZ` stay in the template (a settings page can't safely change its own login). The Plex address
+  moved to the Settings page (text setting, seeded from the template's `PLEX_URL`).
 - **API keys** (`tidb_api_key`, `introdb_api_key`) are write-only files in `/data/secrets/` (dir 700, files 600),
   passed to the tool as file paths only; never rendered, never logged. With no key set here, TheIntroDB falls back
   to `/config/api_key`.
 - **Security (login optional, per the user):** with login off, changes are allowed from the local network (private
-  source IPs; forwarding headers must list only private IPs) and outside connections are read-only. `AUTH_ENABLED=true`
+  source IPs, plus Tailscale's 100.64.0.0/10 by the user's choice; forwarding headers must list only such IPs) and outside connections are read-only. `AUTH_ENABLED=true`
   requires login from outside; `AUTH_LOCAL=true` extends it to the LAN. Every change ALWAYS needs a per-process CSRF
   token and a same-origin request. CSP, no framing.
 - **One action at a time:** the daily chain and every UI action share one lock.
@@ -192,3 +198,43 @@ its terms), copying TheIntroDB's data into introdb.app, and sending unreviewed c
   Tracked in `submissions` as segment `idb:intro` / `idb:outro`.
 - Both are dry runs without `--yes`; `--json` lists candidates (the Submit page computes these in the background).
 - Not built yet: a review queue for chapter-derived timings.
+- Fingerprint detections are never submitted: once applied they're IntroSync-written markers, excluded like the rest.
+
+## Fingerprint detection (`FP_ENABLED`, off by default), added 2026-09-18
+IntroSync's own detection ("method 4"), for episodes none of the other sources covers. Instead of Plex's whole-file
+scan, it reads a few seconds of each episode and matches them against a **season sibling whose intro is already known**
+(an intro marker Plex detected itself, or TheIntroDB). History and measurements:
+`/mnt/user/claude/dumb-populate/tidb/experiment/FINDINGS-v1..v4.md`.
+
+- **Intros:** the sibling's intro (±5 s) is the reference fingerprint. The target is read at the season's known intro
+  positions (one 16 s read, checked as two halves that must agree), then 8 s snippets stepping outward, each confirmed
+  by a second one. Short intros (< 24 s) use one continuous window. PAL speed-ups get a sped-up reference.
+  Premieres search further and measure the end from the audio. No seed in the season: the nearest season of the show.
+- **Credits:** single frames near the end ("black + text"), block edges binary-searched, then calibrated against
+  siblings with known credits. Written **only** when the 3 nearest same-release, non-premiere siblings all calibrate
+  within 5 s of each other AND the result sits within 10 s of the season's usual position before the end. An early
+  credits marker would skip story and bring up Up Next too soon, so seasons that don't behave consistently are left alone.
+- **Never:** seeds from introdb.app, chapters or our own detections; submissions of detections anywhere (once applied
+  they're IntroSync-written markers, excluded like the rest); a miss turned into "no intro".
+- **Reads** go through each backend's own WebDAV in small growing byte ranges (never through the mounts, which read
+  ahead): InfiniDysk (Usenet; downloads ~3× the bytes read, it fetches whole articles) and decypharr (Real-Debrid;
+  ~1×). The container needs `/mnt/debrid` (read-only, slave) to follow Plex's symlinks, and small loopback TCP buffers
+  (`--sysctl net.ipv4.tcp_rmem="4096 32768 65536" --sysctl net.ipv4.tcp_wmem="4096 32768 65536"`) so ffmpeg can't pull
+  far ahead through the local proxy.
+- **Settings page:** on/off, credits on/off, InfiniDysk WebDAV address + user, decypharr address, and the InfiniDysk
+  WebDAV password as a write-only secret (DUMB's `infinidysk.webdav_password`; the user enters it, it's not copied).
+- **Worker:** `main.mjs` runs `fingerprint.mjs detect` in rounds of up to an hour, back to back, beside the
+  one-at-a-time lock (it only reads Plex and the ledger). It runs while people stream (the user's call: only writes
+  to Plex's database wait for that, and those happen in `apply`), and when there's nothing left looks again every
+  6 hours. No download limit (Usenet is unlimited, per the user); what it read is recorded per day (`reads`) and
+  shown on the Status page.
+- **Order:** most recently watched shows first.
+- **Store** `/data/fingerprints.db` (keyed to the FILE: path + size, so a replaced/upgraded file is simply redone):
+  `refs` (reference fingerprints, ~6 KB each: each read once, ever), `sib_credits` (sibling calibrations),
+  `detections` (every outcome; misses retried after 30 days, read errors after 1 day, or on a new detector version),
+  `reads`, `validation`, `state`.
+- **Plan:** detections are the lowest-ranked source (`fingerprint`), used only if made on the file Plex has now.
+  Switching the source off stops using them (`--no-fingerprint`); markers already written stay until undone.
+- **By hand:** `docker exec IntroSync node /app/fingerprint.mjs status` · `selftest` ·
+  `detect --validate 15` (blind test on episodes WITH known timings, compared, nothing written to Plex) ·
+  `detect --dry-run --limit 5` (no detections stored).

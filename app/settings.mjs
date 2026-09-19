@@ -4,8 +4,9 @@
 // or its default; after that the file wins and the environment is ignored for these keys.
 // API keys are separate write-only files in $TIDB_DATA_DIR/secrets/ (dir 700, files 600): the UI can set,
 // replace or clear them but never reads them back, and nothing here logs them.
-// Login (AUTH_*), ports, paths and PLEX_URL deliberately stay in the template: they're the root of trust
-// and the plumbing, and a settings page can't safely change its own login.
+// Login (AUTH_*), ports and paths deliberately stay in the template: they're the root of trust and the plumbing, and a
+// settings page can't safely change its own login. The Plex URL moved here (2026-09-18, user: parameters belong in the UI,
+// not docker variables); it seeds from the template's old PLEX_URL.
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -40,10 +41,23 @@ export const SCHEMA = [
       help: 'Local time (HH:MM). After Plex\'s maintenance window, so markers Plex wiped overnight are re-applied.' },
     { key: 'RUN_ON_START', type: 'bool', def: false, group: 'Schedule', label: 'Also run when the container starts',
       help: 'Runs the whole chain, writes included if enabled, 15 s after every start or recreate. Prefer Run now.' },
+    { key: 'FP_ENABLED', type: 'bool', def: false, group: 'Fingerprint detection', label: 'Detect missing intros and credits from the files themselves',
+      help: 'For episodes no other source covers: matches a few seconds of audio against a season sibling whose intro is already known (a marker Plex detected, or TheIntroDB). Reads only small parts of each file (median ~260 MB of Usenet per episode vs 1.5-3 GB for a Plex scan) and works through the library continuously, streams or not: it never writes Plex\'s database itself. Results are used as the lowest-ranked source and are never submitted to TheIntroDB or introdb.app. Needs the InfiniDysk WebDAV password (below) and the /mnt/debrid folder in the container.' },
+    { key: 'FP_CREDITS', type: 'bool', def: true, group: 'Fingerprint detection', label: 'Also detect end credits',
+      help: 'Only written when two episodes of the same release with known credits agree on the calibration within 5 s; seasons that don\'t agree are left alone.' },
+    { key: 'FP_WEBDAV_URL', type: 'text', url: true, def: 'http://192.168.0.100:8080', pattern: /^https?:\/\/[^\s/?#]+(:\d+)?\/?$/i, group: 'Fingerprint detection',
+      label: 'InfiniDysk WebDAV address', help: 'Where Usenet files are read from, in small byte ranges (the mount would read ahead ~10x more).' },
+    { key: 'FP_WEBDAV_USER', type: 'text', def: 'admin', pattern: /^[^\s:]{1,64}$/, group: 'Fingerprint detection', label: 'InfiniDysk WebDAV user',
+      help: 'The password is set under Keys and passwords below.' },
+    { key: 'FP_DECYPHARR_URL', type: 'text', url: true, def: 'http://192.168.0.100:28282', pattern: /^https?:\/\/[^\s/?#]+(:\d+)?\/?$/i, group: 'Fingerprint detection',
+      label: 'decypharr address (Real-Debrid files)', help: "decypharr's web port; its WebDAV (/webdav) serves Real-Debrid files in small byte ranges without read-ahead. No password. If it isn't reachable, Real-Debrid files are just skipped." },
+    { key: 'PLEX_URL', type: 'text', url: true, def: 'http://192.168.0.100:32400', pattern: /^https?:\/\/[^\s/?#]+(:\d+)?\/?$/i, group: 'Connections', label: 'Plex address',
+      help: 'Used to check that Plex is running and whether anyone is streaming (writes and fingerprint reads wait for that).' },
 ];
 export const SECRETS = {
     tidb_api_key: { label: 'TheIntroDB API key', help: 'Raises lookups to 1000/day and is required to submit. From your theintrodb.org account.' },
-    introdb_api_key: { label: 'introdb.app API key', help: 'Stored for future introdb.app submissions (not used yet). Starts with idb_.' },
+    introdb_api_key: { label: 'introdb.app API key', help: 'Required to submit to introdb.app (Submit page). Starts with idb_.' },
+    infinidysk_password: { label: 'InfiniDysk WebDAV password', help: 'Needed only for fingerprint detection. Read-only use: files are only read, never changed.' },
 };
 
 const BY_KEY = Object.fromEntries(SCHEMA.map(s => [s.key, s]));
@@ -66,6 +80,11 @@ export function coerce(s, raw) {
         const v = String(raw).trim();
         if (!s.options.includes(v)) throw new Error(`${s.label}: one of ${s.options.join(', ')}`);
         return v;
+    }
+    if (s.type === 'text') {
+        const v = String(raw ?? '').trim();
+        if (!v || v.length > 200 || !s.pattern.test(v)) throw new Error(`${s.label}: not a valid value`);
+        return s.url ? v.replace(/\/+$/, '') : v;
     }
     if (s.type === 'time') {
         const v = String(raw).trim();

@@ -1,5 +1,6 @@
 FROM node:22-alpine
-RUN apk add --no-cache curl tini tzdata
+# ffmpeg: fingerprint detection (fingerprint.mjs) reads audio snippets and single frames
+RUN apk add --no-cache curl tini tzdata ffmpeg
 WORKDIR /app
 COPY app/ /app/
 ENV TIDB_DATA_DIR=/data \

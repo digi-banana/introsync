@@ -18,12 +18,13 @@ All run settings (sources, writing on/off, schedule, budgets, backups, API keys)
 Build: docker build -t local/introsync:latest /mnt/cache/appdata/introsync&#13;
 Icon: node /mnt/cache/appdata/introsync/make-icon.mjs&#13;
 Manual stages: docker exec IntroSync node /app/tidb-sync.mjs status|sources|plan|selftest|undo log --yes --live&#13;
+Fingerprint detection (optional, off by default; Settings page): detects intros/credits on episodes no source covers from a few seconds of each file, via the backends' WebDAV. Uses the /mnt/debrid folder below (read-only) and the two --sysctl flags in Extra Parameters (small loopback buffers, so reads stay small). docker exec IntroSync node /app/fingerprint.mjs status&#13;
 Docs: /mnt/cache/appdata/introsync/README.md</Overview>
   <Category>MediaServer:Video Tools:</Category>
   <WebUI>http://[IP]:[PORT:8897]/</WebUI>
   <TemplateURL/>
   <Icon>/mnt/cache/appdata/introsync/icon.png</Icon>
-  <ExtraParams>--restart unless-stopped</ExtraParams>
+  <ExtraParams>--restart unless-stopped --sysctl net.ipv4.tcp_rmem="4096 32768 65536" --sysctl net.ipv4.tcp_wmem="4096 32768 65536"</ExtraParams>
   <PostArgs/>
   <CPUset/>
   <DateInstalled>1789707251</DateInstalled>
@@ -39,7 +40,8 @@ Docs: /mnt/cache/appdata/introsync/README.md</Overview>
   <Config Name="Config" Target="/config" Default="/mnt/cache/appdata/introsync/config" Mode="ro" Description="api_key (TheIntroDB, optional)." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/introsync/config</Config>
   <Config Name="Plex data" Target="/plex" Default="/mnt/cache/appdata/DUMB/data/plex/Plex Media Server" Mode="rw" Description="Plex's library DB (written only when APPLY_ENABLED=true) and Preferences.xml (token for the active-session check). Must be the /mnt/cache path, never /mnt/user." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/cache/appdata/DUMB/data/plex/Plex Media Server</Config>
   <Config Name="Backups" Target="/backups" Default="/mnt/cache/appdata/introsync/backups" Mode="rw" Description="Full Plex DB backup taken before each apply (~520 MB each). How many are kept is set by Plex DB backups to keep (KEEP_BACKUPS)." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/cache/appdata/introsync/backups</Config>
-  <Config Name="Plex URL" Target="PLEX_URL" Default="http://192.168.0.100:32400" Mode="" Description="Used to confirm whether Plex is running and to count active sessions before writing." Type="Variable" Display="advanced" Required="true" Mask="false">http://192.168.0.100:32400</Config>
+  <Config Name="Plex URL" Target="PLEX_URL" Default="http://192.168.0.100:32400" Mode="" Description="Seeds the Plex address on the Settings page at first start; change it there afterwards." Type="Variable" Display="advanced" Required="true" Mask="false">http://192.168.0.100:32400</Config>
+  <Config Name="Media (read-only, fingerprint detection)" Target="/mnt/debrid" Default="/mnt/cache/appdata/DUMB/mnt/debrid" Mode="ro,slave" Description="DUMB's /mnt/debrid folder, so fingerprint detection can follow Plex's file paths to InfiniDysk / decypharr (it reads through their WebDAV, never through these mounts). Read-only." Type="Path" Display="advanced" Required="false" Mask="false">/mnt/cache/appdata/DUMB/mnt/debrid</Config>
   <Config Name="TZ" Target="TZ" Default="America/New_York" Mode="" Description="" Type="Variable" Display="advanced" Required="false" Mask="false">America/New_York</Config>
   <Config Name="Hide Node experimental warnings" Target="NODE_NO_WARNINGS" Default="1" Mode="" Description="" Type="Variable" Display="advanced" Required="false" Mask="false">1</Config>
   <TailscaleStateDir/>

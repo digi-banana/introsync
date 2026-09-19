@@ -11,7 +11,9 @@ export function ago(sec) {
     return d < 90 ? 'just now' : d < 5400 ? `${Math.round(d / 60)} min ago` : d < 172800 ? `${Math.round(d / 3600)} h ago` : `${Math.round(d / 86400)} days ago`;
 }
 const t = (ms) => { const s = Math.round(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
-const BADGE = { plex: 'Plex', tidb: 'TheIntroDB', chapters: 'chapters', introdb: 'introdb.app', mixed: 'mixed' };
+const BADGE = { plex: 'Plex', tidb: 'TheIntroDB', chapters: 'chapters', introdb: 'introdb.app', fingerprint: 'fingerprint', mixed: 'mixed' };
+// Source columns, in plan priority order (tidb-sync.mjs mergeSources)
+const SRC_COLS = ['plex', 'tidb', 'chapters', 'introdb', 'fingerprint', 'mixed'];
 const badge = (src) => `<span class="b b-${esc(src)}">${esc(BADGE[src] ?? src)}</span>`;
 
 const CSS = `
@@ -32,8 +34,10 @@ button.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)
 .b{display:inline-block;border-radius:6px;padding:0 6px;font-size:12px;margin:1px 2px;white-space:nowrap;border:1px solid var(--line)}
 .b-plex{background:#e7f1ff;color:#1d4f91;border-color:#b8d3f5}.b-tidb{background:#efe9ff;color:#4b2fb8;border-color:#cfc2fb}
 .b-chapters{background:#e6f6ee;color:#146b45;border-color:#b7e2cb}.b-introdb{background:#fff0e3;color:#9a4b00;border-color:#f6cfa8}.b-mixed{background:#f1f1f4;color:#555;border-color:#d8d8e0}
+.b-fingerprint{background:#e3f5f7;color:#0b6470;border-color:#aee0e6}
 @media (prefers-color-scheme:dark){.b-plex{background:#162a45;color:#9cc4ff;border-color:#244870}.b-tidb{background:#241c45;color:#c3b3ff;border-color:#3d2f75}
-.b-chapters{background:#12301f;color:#8fe0b3;border-color:#1f5537}.b-introdb{background:#35220d;color:#ffc58f;border-color:#5a3a16}.b-mixed{background:#26262e;color:#bbb;border-color:#3a3a44}}
+.b-chapters{background:#12301f;color:#8fe0b3;border-color:#1f5537}.b-introdb{background:#35220d;color:#ffc58f;border-color:#5a3a16}.b-mixed{background:#26262e;color:#bbb;border-color:#3a3a44}
+.b-fingerprint{background:#0f2d31;color:#8fdde6;border-color:#1c4f56}}
 .banner{border:1px solid var(--warn);background:var(--warnbg);border-radius:10px;padding:10px 14px;margin-bottom:16px}
 .flash{border:1px solid var(--accent);border-radius:10px;padding:10px 14px;margin-bottom:16px}.flash.err{border-color:var(--bad);color:var(--bad)}
 label{display:block;font-weight:600}.help{color:var(--mute);font-size:13px;margin:2px 0 0;font-weight:400}.field{padding:10px 0;border-bottom:1px solid var(--line)}
@@ -69,17 +73,18 @@ export function statusPage(c) {
     const { status, sources } = c.snap;
     const items = Object.fromEntries((status?.items ?? []).map(r => [r.kind, r.n]));
     const srcRows = Object.entries(sources?.markers ?? {}).map(([type, x]) =>
-        `<tr><th>${esc(type)}</th><td>${n(x.plex)}</td><td>${n(x.tidb)}</td><td>${n(x.chapters)}</td><td>${n(x.introdb)}</td><td>${n(x.mixed)}</td></tr>`).join('');
+        `<tr><th>${esc(type)}</th>${SRC_COLS.map(k => `<td>${n(x[k])}</td>`).join('')}</tr>`).join('');
     return layout({ title: 'Status', active: '/', authOn: c.authOn, running: c.running, flash: c.flash, body: `
-<p class="sub">Intro &amp; credits markers for Plex from TheIntroDB, then the files' own chapter names, then introdb.app.
+<p class="sub">Intro &amp; credits markers for Plex from TheIntroDB, then the files' own chapter names, then introdb.app, then IntroSync's own fingerprint detection.
 ${c.running ? '' : `Next scheduled run: <b>${esc(c.nextRunAt?.toLocaleString('en-US') ?? '–')}</b>.`}</p>
 <div class="card inline">${chips(c.settings)}
 ${form('/run', c.csrf, `<button${dis(c)}>Run now</button>`, { confirm: c.settings.APPLY_ENABLED ? 'Run the full chain now? Writing is ON, so markers will be written into Plex.' : 'Run lookups and plan now? (Writing is off.)' })}
 <span class="muted">${c.settings.APPLY_ENABLED ? 'Each run writes markers into Plex.' : 'Runs look up and plan only (writing is off).'}</span></div>
 ${usageCard(c)}
+${fingerprintCard(c)}
 <div class="grid">
 <div class="card"><h2>Library</h2><div class="row"><div><div class="big">${n(items.ep)}</div>episodes</div><div><div class="big">${n(items.movie)}</div>movies</div><div><div class="big">${n(status?.showsWithData)}</div>shows with TheIntroDB data</div></div></div>
-<div class="card"><h2>Markers in Plex by source</h2><table><thead><tr><th></th><th>Plex</th><th>TheIntroDB</th><th>chapters</th><th>introdb.app</th><th>mixed</th></tr></thead><tbody>${srcRows}</tbody></table>
+<div class="card"><h2>Markers in Plex by source</h2><table><thead><tr><th></th>${SRC_COLS.map(k => `<th>${esc(BADGE[k])}</th>`).join('')}</tr></thead><tbody>${srcRows}</tbody></table>
 <p class="muted" style="margin:8px 0 0">${n(sources?.writtenByUs)} written by IntroSync · ${n(sources?.noLongerInPlex_reappliedNextRun)} wiped by Plex (re-applied next run)</p></div>
 </div>
 <div class="card" style="margin-top:16px"><h2>Run history</h2>${historyTable(c.history.slice(0, 12))}
@@ -89,8 +94,34 @@ ${usageCard(c)}
 function chips(s) {
     const pills = [['Writing', s.APPLY_ENABLED ? 'on' : 'off', s.APPLY_ENABLED], ['TheIntroDB', s.TIDB_ENABLED ? 'on' : 'off'],
                    ['chapters', s.CHAPTERS_ENABLED ? 'on' : 'off'], ['introdb.app', s.INTRODB_ENABLED ? 'on' : 'off'],
-                   ['PAL guard', s.PAL_GUARD ? 'on' : 'off'], ['policy', s.POLICY], ['daily', s.RUN_AT]];
+                   ['fingerprint', s.FP_ENABLED ? 'on' : 'off'], ['PAL guard', s.PAL_GUARD ? 'on' : 'off'], ['policy', s.POLICY], ['daily', s.RUN_AT]];
     return pills.map(([k, v, w]) => `<span class="pill${w ? ' warn' : ''}">${esc(k)}: ${esc(v)}</span>`).join('');
+}
+
+// Fingerprint detection (fingerprint.mjs via main.mjs's worker): state, results, and what it read.
+const FP_STATE = { off: 'off', running: 'working through the library', idle: 'idle: nothing left to detect (looks again every 6 hours)',
+    'no-password': 'waiting for the InfiniDysk WebDAV password (Settings)', 'bad-password': 'InfiniDysk rejected the WebDAV password (Settings)',
+    'webdav-unreachable': 'waiting: InfiniDysk WebDAV is not answering (retries in 30 minutes)',
+    'read-errors': 'paused: files could not be read (retries in 30 minutes)', error: 'waiting after an error (see the container log; retries in 30 minutes)' };
+function fingerprintCard(c) {
+    const f = c.fp ?? {};
+    if (!f.enabled && !f.total?.episodes) {
+        return `<div class="card"><h2>Fingerprint detection</h2><p class="muted" style="margin:0">Off. When on, IntroSync detects intros and credits itself on episodes
+no other source covers, from a few seconds of each file matched against a season sibling whose intro is known. <a href="/settings">Settings</a></p></div>`;
+    }
+    const cnt = (kind, sts) => (f.detections ?? []).filter(d => d.kind === kind && sts.includes(d.status)).reduce((a, d) => a + d.n, 0);
+    const gb = (b) => `${((b ?? 0) / 1e9).toFixed(1)} GB`;
+    const q = f.lastRun?.queue;
+    return `<div class="card"><h2>Fingerprint detection</h2>
+<p style="margin:0 0 10px">${badge('fingerprint')} <b>${esc(FP_STATE[f.state] ?? f.state)}</b> <span class="muted">(since ${esc(ago(f.since / 1000))})</span></p>
+<div class="row"><div><div class="big">${n(cnt('intro', ['match']))}</div>intros found</div><div><div class="big">${n(cnt('credits', ['found']))}</div>credits found</div>
+<div><div class="big">${n(cnt('intro', ['miss', 'read-error', 'ref-error']) + cnt('credits', ['miss', 'read-error']))}</div>not found <span class="muted">(retried in 30 days)</span></div>
+<div><div class="big">${q ? n(q.episodes) : '–'}</div>episodes waiting <span class="muted">(at the last round's start)</span></div></div>
+<table style="margin-top:10px"><thead><tr><th></th><th>read: Usenet (InfiniDysk)</th><th>Real-Debrid (decypharr)</th><th>episodes</th></tr></thead><tbody>
+${[['today (UTC)', f.today], ['last 7 days', f.last7], [`total${f.total?.since ? ` since ${f.total.since}` : ''}`, f.total]].map(([k, r]) =>
+    `<tr><th>${esc(k)}</th><td>${gb((r?.bytes ?? 0) - (r?.rd_bytes ?? 0))}</td><td>${gb(r?.rd_bytes)}</td><td>${n(r?.episodes)}</td></tr>`).join('')}</tbody></table>
+<p class="muted" style="margin:8px 0 0">Bytes read through each backend's WebDAV. InfiniDysk downloads about 3× that from Usenet (it fetches whole articles); decypharr about 1×.
+${n(f.refs)} season references saved, so each one is read only once. New detections reach Plex at the next daily run (or Run now).</p></div>`;
 }
 
 // Request usage per service: last request, rolling 24 h, and TheIntroDB's daily limit (500 without a key, 1000 with).
@@ -116,9 +147,9 @@ export function historyTable(rows) {
     const look = (x) => x ? `${n(x.requests)} <span class="muted">· ${n(x.hit)} hit${x.stopped === 'reserve' || x.stopped === 'usage-limit' ? ` · <span class="warn">${esc(x.stopped === 'reserve' ? 'quota' : 'limit')}</span>` : ''}</span>` : '<span class="muted">–</span>';
     const src = (h, k) => h.apply ? n(h.apply.bySource?.[k]) : '<span class="muted">–</span>';
     return `<table><thead><tr><th>started</th><th class="l">trigger</th><th>TheIntroDB<br>lookups</th><th>introdb.app<br>lookups</th>
-<th>written:<br>TheIntroDB</th><th>chapters</th><th>introdb.app</th><th>mixed</th><th>removed</th><th class="l">result</th></tr></thead><tbody>
+<th>written:<br>TheIntroDB</th><th>chapters</th><th>introdb.app</th><th>finger-<br>print</th><th>mixed</th><th>removed</th><th class="l">result</th></tr></thead><tbody>
 ${rows.map(h => `<tr><td class="m">${esc(when(h.start))}</td><td class="l">${esc(h.trigger)}</td><td>${look(h.fetch.tidb)}</td><td>${look(h.fetch.introdb)}</td>
-<td>${src(h, 'tidb')}</td><td>${src(h, 'chapters')}</td><td>${src(h, 'introdb')}</td><td>${src(h, 'mixed')}</td>
+<td>${src(h, 'tidb')}</td><td>${src(h, 'chapters')}</td><td>${src(h, 'introdb')}</td><td>${src(h, 'fingerprint')}</td><td>${src(h, 'mixed')}</td>
 <td>${h.apply ? n(h.apply.deleted) : '<span class="muted">–</span>'}</td><td class="l">${h.result}</td></tr>`).join('')}</tbody></table>`;
 }
 
@@ -130,6 +161,7 @@ export function settingsPage(c) {
         const input = s.type === 'bool' ? `<input type="checkbox" name="${s.key}" value="true"${v ? ' checked' : ''}>`
             : s.type === 'enum' ? `<select name="${s.key}">${s.options.map(o => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select>`
             : s.type === 'time' ? `<input type="time" name="${s.key}" value="${esc(v)}" required>`
+            : s.type === 'text' ? `<input type="text" name="${s.key}" value="${esc(v)}" maxlength="200" required style="min-width:320px">`
             : `<input type="number" name="${s.key}" value="${esc(v)}" min="${s.min}" max="${s.max}" required style="width:110px">`;
         return s.type === 'bool'
             ? `<div class="field"><label>${input}${esc(s.label)}</label><p class="help">${esc(s.help)}</p></div>`
@@ -140,15 +172,15 @@ export function settingsPage(c) {
         const extra = name === 'tidb_api_key' && !set && c.configKey ? ' <span class="muted">(using the key file in the Config folder)</span>' : '';
         return `<div class="field"><label>${esc(m.label)} — ${set ? '<span class="ok">set</span>' : '<span class="muted">not set</span>'}${extra}</label><p class="help">${esc(m.help)} Never shown again after saving.</p>
 ${form('/secrets', c.csrf, `<input type="hidden" name="name" value="${esc(name)}"><div class="inline" style="margin-top:6px">
-<input type="password" name="value" autocomplete="off" placeholder="${set ? 'enter a new key to replace it' : 'paste key'}" style="min-width:320px">
-<button${dis(c)}>Save key</button>${set ? `<button class="ghost" name="clear" value="1"${dis(c)} formnovalidate>Clear</button>` : ''}</div>`)}</div>`;
+<input type="password" name="value" autocomplete="off" placeholder="${set ? 'enter a new one to replace it' : 'paste it here'}" style="min-width:320px">
+<button${dis(c)}>Save</button>${set ? `<button class="ghost" name="clear" value="1"${dis(c)} formnovalidate>Clear</button>` : ''}</div>`)}</div>`;
     }).join('');
     return layout({ title: 'Settings', active: '/settings', authOn: c.authOn, running: c.running, flash: c.flash, body: `
 <p class="sub">Stored in <span class="mono">settings.json</span> in the Data folder. This page is the control: the Unraid template's old variables only seeded it on first start.
-Login, ports, folders and the Plex URL stay in the template.</p>
+Login, ports and folders stay in the template.</p>
 ${form('/settings', c.csrf, groups.map(g => `<div class="card"><h2>${esc(g)}</h2>${SCHEMA.filter(s => s.group === g).map(field).join('')}</div>`).join('')
     + `<div class="card inline"><button${dis(c)}>Save settings</button><span class="muted">Takes effect from the next run. Changing the daily time reschedules immediately.</span></div>`)}
-<div class="card"><h2>API keys</h2>${secretCard}</div>` });
+<div class="card"><h2>Keys and passwords</h2>${secretCard}</div>` });
 }
 
 // ---------------- library ----------------
@@ -173,19 +205,19 @@ ${sh.eps.filter(e => e.season === sn).sort((a, b) => a.ep - b.ep).map(e => `<tr>
     if (flt === 'missing') shows = shows.filter(s => s.withIntro < s.eps.length || s.withCredits < s.eps.length);
     if (flt === 'none') shows = shows.filter(s => s.withIntro === 0 && s.withCredits === 0);
     shows.sort((a, b) => a.title.localeCompare(b.title));
-    const srcCells = (s) => ['plex', 'tidb', 'chapters', 'introdb', 'mixed'].map(k => `<td>${s.src[k] ? n(s.src[k]) : '<span class="muted">·</span>'}</td>`).join('');
+    const srcCells = (s) => SRC_COLS.map(k => `<td>${s.src[k] ? n(s.src[k]) : '<span class="muted">·</span>'}</td>`).join('');
     const mv = L.movies;
     return layout({ title: 'Library', active: '/library', authOn: c.authOn, running: c.running, body: `
 <form method="get" action="/library" class="card inline"><input type="search" name="q" value="${esc(q)}" placeholder="Search shows" style="min-width:240px">
 <select name="f"><option value="">All shows</option><option value="missing"${flt === 'missing' ? ' selected' : ''}>Missing some markers</option><option value="none"${flt === 'none' ? ' selected' : ''}>No markers at all</option></select>
 <button>Filter</button><span class="muted">${n(shows.length)} shows</span></form>
-<div class="card"><table><thead><tr><th>show</th><th>episodes</th><th>with intro</th><th>with credits</th><th>${badge('plex')}</th><th>${badge('tidb')}</th><th>${badge('chapters')}</th><th>${badge('introdb')}</th><th>${badge('mixed')}</th></tr></thead><tbody>
+<div class="card"><table><thead><tr><th>show</th><th>episodes</th><th>with intro</th><th>with credits</th>${SRC_COLS.map(k => `<th>${badge(k)}</th>`).join('')}</tr></thead><tbody>
 ${shows.slice(0, 400).map(s => `<tr><td><a href="/library?show=${s.id}">${esc(s.title)}</a></td><td>${n(s.eps.length)}</td>
 <td>${pctCell(s.withIntro, s.eps.length)}</td><td>${pctCell(s.withCredits, s.eps.length)}</td>${srcCells(s)}</tr>`).join('')}
 </tbody></table>${shows.length > 400 ? `<p class="muted">Showing 400 of ${n(shows.length)}; search to narrow.</p>` : ''}</div>
 <div class="card"><h2>Movies</h2><p class="muted" style="margin:0 0 8px">${n(mv.total)} movies · ${n(mv.withCredits)} with a credits marker · ${n(mv.withIntro)} with an intro marker</p>
-<table><thead><tr><th>${badge('plex')}</th><th>${badge('tidb')}</th><th>${badge('chapters')}</th><th>${badge('introdb')}</th><th>${badge('mixed')}</th></tr></thead>
-<tbody><tr>${['plex', 'tidb', 'chapters', 'introdb', 'mixed'].map(k => `<td style="text-align:left">${n(mv.src[k])}</td>`).join('')}</tr></tbody></table></div>` });
+<table><thead><tr>${SRC_COLS.map(k => `<th>${badge(k)}</th>`).join('')}</tr></thead>
+<tbody><tr>${SRC_COLS.map(k => `<td style="text-align:left">${n(mv.src[k])}</td>`).join('')}</tr></tbody></table></div>` });
 }
 const pctCell = (a, b) => b ? `${n(a)} <span class="muted">(${Math.round(100 * a / b)}%)</span>` : '–';
 
