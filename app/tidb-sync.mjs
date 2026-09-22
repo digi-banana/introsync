@@ -80,6 +80,8 @@ const planOpts = () => ({
     useChapters: !flag('no-chapters'),      // the file's own named chapters (Intro / Credits / Recap ...)
     useIntrodb: !flag('no-introdb'),        // introdb.app fills segment types the others lack
     useFingerprint: !flag('no-fingerprint'), // our own audio/video detection (fingerprint.mjs), last resort
+    useCommercials: !flag('no-commercials'), // "Commercial N" chapters (comskip -> comchap) -> commercial markers
+    commercialSections: opt('commercial-sections', 'Sports'),   // library sections (names or ids, comma-separated)
     palGuard: !flag('no-pal-guard'),        // ignore community timestamps on PAL speed-up files (see buildPlan)
 });
 
@@ -151,6 +153,8 @@ const imdbOf = (idExpr) => `(SELECT substr(t.tag, 8) FROM taggings x JOIN tags t
 // metadata_items.duration is the agent's rounded runtime (e.g. 47:00); the file's real length
 // lives in media_items. Off by >30 s for half this library, >3 min for ~3.9k items.
 const fileDur = (idExpr) => `(SELECT max(duration) FROM media_items WHERE metadata_item_id = ${idExpr})`;
+
+const isPalFps = (f) => Math.abs((f ?? 0) - 25) < 0.05 || Math.abs((f ?? 0) - 50) < 0.05;
 
 // A show/movie Plex has tagged with more than one TMDB id is ambiguous (e.g. Hard Knocks has two):
 // skip it rather than guess, both for lookups and for submissions.
@@ -527,7 +531,7 @@ function buildPlan(L, plex, opts) {
     // Our own detections are measured on this exact file (PAL speed included), so the PAL guard doesn't apply to them.
     const fpBy = opts.useFingerprint ? fingerprintBodies(plex) : new Map();
     const stats = { withData: 0, gone: 0, noUsable: 0, add: 0, reapply: 0, update: 0, replacePlex: 0,
-                    keptPlex: 0, alreadyCurrent: 0, droppedOverlap: 0, markers: { intro: 0, credits: 0 },
+                    keptPlex: 0, alreadyCurrent: 0, droppedOverlap: 0, markers: { intro: 0, credits: 0, commercial: 0 },
                     bySource: { tidb: 0, chapters: 0, introdb: 0, fingerprint: 0, mixed: 0 }, retract: 0, spedUpFiles: spedUp.size, palIgnored: 0,
                     fingerprintDetections: fpBy.size };
     const plan = [];
@@ -592,7 +596,72 @@ function buildPlan(L, plex, opts) {
             : `${r.show_title} S${String(r.season).padStart(2, '0')}E${String(r.episode).padStart(2, '0')}`;
         plan.push({ mid: r.mid, label, dur, existing, changes });
     }
+    if (opts.useCommercials) planCommercials(plex, opts, { existingBy, mine, plan, stats });
     return { plan, stats, tagId };
+}
+
+// ---------- commercial markers from comskip chapters (Sports recordings) ----------
+// The DVR trimmer (Unmanic comchap) leaves chapters "Commercial 1..N" alternating with "Chapter N" in each recording.
+// Plex shows "Skip Commercial" for text='commercial' markers (its own DVR comskip writes them: taggings with
+// extra_data NULL + pv:commercials version -1 in media_parts.extra_data), so they're written the same way.
+// Only the configured sections (default: the one named "Sports"); these items have no TMDB id, so they're not in the
+// ledger's items and are found straight from Plex. Plex's own commercial markers are never replaced (policy fill).
+const COMMERCIAL_RX = /^commercials?(\s*\d+)?$/i;
+function commercialSegments(chapters, dur) {
+    const segs = [];
+    for (const c of chapters) {
+        if (!COMMERCIAL_RX.test(String(c.name ?? '').trim())) continue;
+        const start = Math.round(c.start * 1000), end = Math.round(Math.min(c.end * 1000, dur > 0 ? dur : Infinity));
+        if (end - start < 5000 || end - start > 20 * 60000) continue;   // comskip blips / a whole segment misread
+        // At the very start or end it's the trimmed pre/post pad, not a break (e.g. "Commercial 1" 0:00-0:52)
+        if (start < 2000 || (dur > 0 && end > dur - 2000)) continue;
+        const p = segs[segs.length - 1];
+        if (p && start - p.end <= 1000) { p.end = Math.max(p.end, end); continue; }   // back-to-back breaks: one marker
+        segs.push({ text: 'commercial', src: 'chapters:commercial', start, end, final: 0 });
+    }
+    return segs;
+}
+function planCommercials(plex, opts, { existingBy, mine, plan, stats }) {
+    const want = new Set(String(opts.commercialSections ?? '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
+    const secs = plex.prepare('SELECT id, name FROM library_sections').all()
+        .filter(s => want.has(String(s.id)) || want.has(String(s.name).toLowerCase())).map(s => s.id);
+    stats.commercialSections = secs;
+    if (!secs.length) return;
+    const rows = plex.prepare(`SELECT m.id mid, m.title, gp.title show, mi.duration dur, mp.extra_data x,
+            (SELECT count(*) FROM media_items mi2 JOIN media_parts mp2 ON mp2.media_item_id = mi2.id
+             WHERE mi2.metadata_item_id = m.id AND mi2.deleted_at IS NULL AND mp2.deleted_at IS NULL) parts
+        FROM metadata_items m JOIN media_items mi ON mi.metadata_item_id = m.id JOIN media_parts mp ON mp.media_item_id = mi.id
+        LEFT JOIN metadata_items p ON p.id = m.parent_id LEFT JOIN metadata_items gp ON gp.id = p.parent_id
+        WHERE m.library_section_id IN (${secs.map(() => '?').join(',')}) AND m.deleted_at IS NULL AND mi.deleted_at IS NULL
+          AND mp.deleted_at IS NULL AND mp.extra_data LIKE '%Commercial%'`).all(...secs);
+    stats.commercialItems = 0;
+    for (const r of rows) {
+        if (r.parts !== 1) continue;                    // one file only: chapters and markers describe the same timeline
+        let ch; try { ch = JSON.parse(JSON.parse(r.x)['pv:chapters']).Chapters?.Chapter; } catch { continue; }
+        if (!Array.isArray(ch)) continue;
+        const w = commercialSegments(ch, r.dur || 0);
+        if (!w.length) continue;
+        stats.commercialItems++;
+        const existing = existingBy.get(r.mid) ?? [];
+        const ex = existing.filter(m => m.text === 'commercial');
+        const mn = mine.all(r.mid).filter(m => m.text === 'commercial');
+        let action = null;
+        if (!ex.length) action = mn.length ? 'reapply' : 'add';
+        else if (mn.length && sameSet(ex, mn)) action = sameSet(ex, w) ? null : 'update';
+        else { stats.keptPlex++; continue; }              // Plex's own commercial markers: leave them
+        if (!action) { stats.alreadyCurrent++; continue; }
+        const removeIds = new Set(ex.map(m => m.id));
+        const kept = existing.filter(m => !removeIds.has(m.id));
+        const add = w.filter(m => { const clash = kept.some(k => m.start <= k.end && k.start <= m.end); if (clash) stats.droppedOverlap++; return !clash; });
+        if (!add.length && !removeIds.size) continue;
+        stats[action]++;
+        stats.markers.commercial += add.length;
+        stats.bySource.chapters += add.length;
+        const change = { action, remove: [...removeIds], add };
+        const prev = plan.find(p => p.mid === r.mid);
+        if (prev) prev.changes.commercial = change;
+        else plan.push({ mid: r.mid, label: `${r.show ? `${r.show}: ` : ''}${r.title}`, dur: r.dur || 0, existing, changes: { commercial: change } });
+    }
 }
 
 function planCmd() {
@@ -629,7 +698,7 @@ function encodeExtra(core) {
     return JSON.stringify(sorted);
 }
 
-function rewriteExtra(raw, types, intros, credits) {
+function rewriteExtra(raw, types, intros, credits, commercials = []) {
     let obj;
     try { obj = JSON.parse(raw); } catch { return null; }
     if (!obj || typeof obj !== 'object' || !('url' in obj)) return null;   // pre-1.40 PMS format: leave alone
@@ -644,6 +713,11 @@ function rewriteExtra(raw, types, intros, credits) {
                 ? { startTimeOffset: m.start, endTimeOffset: m.end, final: true }
                 : { startTimeOffset: m.start, endTimeOffset: m.end }) } }
             : { attributeName: 'credits', version: 4 };
+    }
+    if (types.has('commercial')) {                     // as Plex's own DVR comskip writes it (version -1)
+        if (commercials.length) core['pv:commercials'] = { MediaPartMarkersArray: { attributeName: 'commercials', version: -1,
+            MediaPartMarker: commercials.map(m => ({ startTimeOffset: m.start, endTimeOffset: m.end })) } };
+        else delete core['pv:commercials'];
     }
     return encodeExtra(core);
 }
@@ -774,7 +848,7 @@ async function applyCmd() {
                         if (m.idx !== j) { U({ op: 'index', mid: p.mid, id: m.id, old: m.idx }); q.idx.run(j, m.id); }
                         return;
                     }
-                    const extra = m.text === 'intro' ? EXTRA.intro : m.final ? EXTRA.creditsFinal : EXTRA.credits;
+                    const extra = m.text === 'intro' ? EXTRA.intro : m.text === 'commercial' ? null : m.final ? EXTRA.creditsFinal : EXTRA.credits;
                     const id = Number(q.ins.run(p.mid, tagId, j, m.text, m.start, m.end, t, extra).lastInsertRowid);
                     U({ op: 'insert', mid: p.mid, id });
                     done.inserted++;
@@ -783,8 +857,9 @@ async function applyCmd() {
                 const intros = all.filter(m => m.text === 'intro');
                 const credits = all.filter(m => m.text === 'credits')
                     .map(m => ({ ...m, final: m.kept ? Number((m.extra_data || '').includes('final')) : m.final }));
+                const commercials = all.filter(m => m.text === 'commercial');
                 for (const part of q.parts.all(p.mid)) {
-                    const next = rewriteExtra(part.extra_data, types, intros, credits);
+                    const next = rewriteExtra(part.extra_data, types, intros, credits, commercials);
                     if (next && next !== part.extra_data) {
                         U({ op: 'extra', mid: p.mid, part_id: part.id, old: part.extra_data });
                         q.extra.run(next, part.id);
@@ -852,12 +927,13 @@ async function submitCmd() {
     const L = openLedger();
     const plex = openPlex(true);
     const tagId = markerTagId(plex);
-    // Only episodes Plex itself matched to a TMDB *episode* (so Plex numbering = TMDB numbering),
-    // one intro marker, and within TIDB's 5-200 s intro bounds.
+    // Only episodes Plex itself matched to a TMDB *episode* (so Plex numbering = TMDB numbering), with exactly one
+    // marker of that type, within TIDB's bounds (intro 5-200 s, credits 5 s-30 min).
     const rows = plex.prepare(`
         SELECT e.id mid, CAST(substr(sg.tag, 8) AS INTEGER) tmdb, se."index" season, e."index" episode, ${fileDur('e.id')} duration,
                (SELECT max(duration) - min(duration) FROM media_items WHERE metadata_item_id = e.id) spread,
-               sh.title show, tg.time_offset start_ms, tg.end_time_offset end_ms,
+               (SELECT max(frames_per_second) FROM media_items WHERE metadata_item_id = e.id) fps,
+               tg.text segment, sh.title show, tg.time_offset start_ms, tg.end_time_offset end_ms,
                (SELECT substr(t.tag, 8) FROM taggings x JOIN tags t ON t.id = x.tag_id
                  WHERE x.metadata_item_id = e.id AND t.tag_type = 314 AND t.tag LIKE 'imdb://%' LIMIT 1) imdb
         FROM taggings tg
@@ -866,8 +942,8 @@ async function submitCmd() {
         JOIN metadata_items sh ON sh.id = se.parent_id
         JOIN taggings stg ON stg.metadata_item_id = sh.id
         JOIN tags sg ON sg.id = stg.tag_id AND sg.tag_type = 314 AND sg.tag LIKE 'tmdb://%'
-        WHERE tg.tag_id = ? AND tg.text = 'intro' AND se."index" >= 1 AND e."index" >= 1 AND ${singleTmdb('sh.id')}
-          AND (SELECT count(*) FROM taggings y WHERE y.metadata_item_id = e.id AND y.tag_id = ? AND y.text = 'intro') = 1
+        WHERE tg.tag_id = ? AND tg.text IN ('intro', 'credits') AND se."index" >= 1 AND e."index" >= 1 AND ${singleTmdb('sh.id')}
+          AND (SELECT count(*) FROM taggings y WHERE y.metadata_item_id = e.id AND y.tag_id = ? AND y.text = tg.text) = 1
           AND EXISTS (SELECT 1 FROM taggings z JOIN tags t ON t.id = z.tag_id
                       WHERE z.metadata_item_id = e.id AND t.tag_type = 314 AND t.tag LIKE 'tmdb://%')`).all(tagId, tagId);
     plex.close();
@@ -878,35 +954,46 @@ async function submitCmd() {
     // Plex's taggings also hold markers WE wrote from TheIntroDB (an echo), from introdb.app (copying it into
     // TheIntroDB is barred by introdb.app's terms), and from chapters (need user review first). Any marker
     // matching an `applied` row is ours, so it's excluded here. (All 419 earlier submissions predate 04:40Z.)
-    const ours = L.prepare(`SELECT 1 FROM applied WHERE mid = ? AND text = 'intro' AND start_ms = ? AND end_ms = ?`);
+    const ours = L.prepare('SELECT 1 FROM applied WHERE mid = ? AND text = ? AND start_ms = ? AND end_ms = ?');
     const cands = [];
     const agree = { compared: 0, within2s: 0, within5s: 0, worse: [] };
-    let skippedOurs = 0;
+    const only = opt('segment', '');                      // optional: submit just intros, or just credits
+    let skippedOurs = 0, skippedPal = 0;
     for (const r of rows) {
+        const seg = r.segment;
+        if (only && seg !== only) continue;
         const len = r.end_ms - r.start_ms;
-        if (len < 5000 || len > 200000 || done.get(r.mid, 'intro')) continue;
-        if (ours.get(r.mid, r.start_ms, r.end_ms)) { skippedOurs++; continue; }
+        if (len < 5000 || len > (seg === 'intro' ? 200000 : 1800000) || done.get(r.mid, seg)) continue;
+        if (ours.get(r.mid, seg, r.start_ms, r.end_ms)) { skippedOurs++; continue; }
+        // Omit the duration when versions of different length exist: we can't tell which one Plex analyzed.
+        const withDuration = r.duration >= 300000 && r.duration <= 21600000 && r.spread <= 2000;
+        // A PAL speed-up plays 4.3% fast, so its timings only make sense tied to that cut's duration.
+        if (isPalFps(r.fps) && !withDuration) { skippedPal++; continue; }
         const l = tidb.get(r.mid);
-        const ti = l?.status === 200 ? JSON.parse(l.body).intro?.[0] : null;
-        if (ti?.end_ms != null) {
-            const d = Math.max(Math.abs((ti.start_ms ?? 0) - r.start_ms), Math.abs(ti.end_ms - r.end_ms));
+        const body = l?.status === 200 ? JSON.parse(l.body) : null;
+        const t = seg === 'intro' ? body?.intro?.[0] : body?.credits?.[0];
+        if (seg === 'intro' ? t?.end_ms != null : t?.start_ms != null) {
+            const d = seg === 'intro' ? Math.max(Math.abs((t.start_ms ?? 0) - r.start_ms), Math.abs(t.end_ms - r.end_ms))
+                : Math.abs(t.start_ms - r.start_ms);
             agree.compared++;
             if (d <= 2000) agree.within2s++;
             if (d <= 5000) agree.within5s++;
-            else agree.worse.push(`${r.show} S${r.season}E${r.episode}: plex ${r.start_ms}-${r.end_ms} tidb ${ti.start_ms ?? 0}-${ti.end_ms}`);
+            else agree.worse.push(`${r.show} S${r.season}E${r.episode} ${seg}: plex ${r.start_ms}-${r.end_ms} tidb ${t.start_ms ?? 0}-${t.end_ms ?? 'EOF'}`);
         }
-        const body = { tmdb_id: r.tmdb, type: 'tv', segment: 'intro', season: r.season, episode: r.episode,
-                       start_ms: r.start_ms, end_ms: r.end_ms };
-        // Omit the duration when versions of different length exist: we can't tell which one Plex analyzed.
-        if (r.duration >= 300000 && r.duration <= 21600000 && r.spread <= 2000) body.video_duration_ms = r.duration;
-        if (/^tt\d{7,8}$/.test(r.imdb || '')) body.imdb_id = r.imdb;
-        cands.push({ mid: r.mid, label: `${r.show} S${r.season}E${r.episode}`, body });
+        const sub = { tmdb_id: r.tmdb, type: 'tv', segment: seg, season: r.season, episode: r.episode, start_ms: r.start_ms };
+        // Credits running to the end of the file: TIDB's own convention is end null = end of media.
+        if (seg === 'intro' || !(r.duration > 0) || r.end_ms < r.duration - 2000) sub.end_ms = r.end_ms;
+        if (withDuration) sub.video_duration_ms = r.duration;
+        if (/^tt\d{7,8}$/.test(r.imdb || '')) sub.imdb_id = r.imdb;
+        cands.push({ mid: r.mid, label: `${r.show} S${r.season}E${r.episode}`, body: sub });
     }
-    log('submit candidates', { plexIntrosEligible: rows.length, skippedIntroSyncWritten: skippedOurs, toSubmit: cands.length,
-        agreementWithTidb: { ...agree, worse: agree.worse.length } });
+    const bySeg = cands.reduce((m, c) => (m[c.body.segment] = (m[c.body.segment] ?? 0) + 1, m), {});
+    log('submit candidates', { plexMarkersEligible: rows.length, skippedIntroSyncWritten: skippedOurs, skippedPalSpeedUp: skippedPal,
+        toSubmit: cands.length, bySegment: bySeg, agreementWithTidb: { ...agree, worse: agree.worse.length } });
     for (const w of agree.worse.slice(0, 10)) console.log(`  disagrees >5s: ${w}`);
-    if (flag('json')) return console.log(JSON.stringify({ eligible: rows.length, skippedIntroSyncWritten: skippedOurs,
-        candidates: cands.map(c => ({ mid: c.mid, label: c.label, segment: 'intro', start_ms: c.body.start_ms, end_ms: c.body.end_ms })) }));
+    if (flag('json')) return console.log(JSON.stringify({ eligible: rows.length, skippedIntroSyncWritten: skippedOurs, skippedPalSpeedUp: skippedPal,
+        bySegment: bySeg,
+        candidates: cands.map(c => ({ mid: c.mid, label: c.label, segment: c.body.segment, start_ms: c.body.start_ms, end_ms: c.body.end_ms ?? null })) }));
 
     if (!flag('yes')) {
         for (const c of cands.slice(0, 3)) console.log('  dry-run', c.label, JSON.stringify(c.body));
@@ -932,7 +1019,7 @@ async function submitCmd() {
         let accepted = 'ok';
         try { accepted = JSON.parse(text).submissions?.[0]?.status ?? 'ok'; } catch { }
         const status = r.ok ? accepted : dup ? 'duplicate' : 'error';
-        put.run(c.mid, 'intro', c.body.start_ms, c.body.end_ms, dup ? 200 : r.status, status, text.slice(0, 500), now());
+        put.run(c.mid, c.body.segment, c.body.start_ms, c.body.end_ms ?? null, dup ? 200 : r.status, status, text.slice(0, 500), now());
         if (r.ok) tally.ok++; else if (dup) tally.duplicate++; else { tally.failed++; log(`submit ${c.label}: ${r.status} ${text.slice(0, 200)}`); }
         if (tally.failed >= 5 && tally.failed > tally.ok) { log('submit: too many failures, stopping'); break; }
         await sleep(PACE_MS);
@@ -1010,6 +1097,7 @@ async function submitIdbCmd() {
     const put = L.prepare(`INSERT OR REPLACE INTO submissions(mid, segment, start_ms, end_ms, http, status, response, submitted_at, origin)
                            VALUES (?,?,?,?,?,?,?,?, 'plex')`);
     const tally = { sent: 0, ok: 0, rateLimited: 0, rejected: 0, failed: 0 };
+    let consec429 = 0;
     for (const c of cands.slice(0, Number(opt('limit', 0)) || cands.length)) {
         let r;
         try {
@@ -1021,10 +1109,22 @@ async function submitIdbCmd() {
         tally.sent++;
         if (r.status === 401) { log('submit-introdb: API key rejected (401), stopping'); break; }
         const status = r.ok ? 'ok' : r.status === 429 ? 'rate-limited' : r.status === 400 ? 'rejected' : 'error';
+        if (r.status !== 429) consec429 = 0;
         put.run(c.mid, `idb:${c.segment}`, Math.round(c.body.start_sec * 1000), Math.round(c.body.end_sec * 1000),
                 r.status, status, text.slice(0, 500), now());
         if (r.ok) tally.ok++;
-        else if (r.status === 429) tally.rateLimited++;                       // per segment+episode; others can go on
+        else if (r.status === 429) {
+            // Two different 429s: their documented per-episode limit (1 per segment/episode/5 min), and an account-wide
+            // cap of 100 submissions an hour, which just returns "limit":100 for everything. Three in a row means the
+            // hourly cap, so stop instead of burning the rest of the batch on refusals (2026-09-21: 201 wasted).
+            tally.rateLimited++;
+            if (++consec429 >= 3) {
+                let reset = null; try { reset = JSON.parse(text).reset_at ?? null; } catch { }
+                tally.stopped = 'rate-limited'; tally.resetAt = reset;
+                log(`submit-introdb: hourly limit reached (their cap is 100/h)${reset ? `, resets ${reset}` : ''}; stopping`);
+                break;
+            }
+        }
         else if (r.status === 400) { tally.rejected++; log(`submit-introdb ${c.label} ${c.segment}: 400 ${text.slice(0, 160)}`); }
         else { tally.failed++; log(`submit-introdb ${c.label}: ${r.status} ${text.slice(0, 160)}`); }
         if (tally.failed >= 5 && tally.failed > tally.ok) { log('submit-introdb: too many failures, stopping'); break; }
@@ -1042,7 +1142,7 @@ function sourcesCmd() {
     const plex = openPlex(true);
     const tagId = markerTagId(plex);
     const marks = plex.prepare(`SELECT metadata_item_id mid, text, time_offset start, end_time_offset "end"
-                                FROM taggings WHERE tag_id = ? AND text IN ('intro', 'credits')`).all(tagId);
+                                FROM taggings WHERE tag_id = ? AND text IN ('intro', 'credits', 'commercial')`).all(tagId);
     plex.close();
     const ours = new Map(L.prepare('SELECT mid, text, start_ms, end_ms, source FROM applied').all()
         .map(a => [`${a.mid}|${a.text}|${a.start_ms}|${a.end_ms}`, a.source]));
@@ -1097,10 +1197,11 @@ const COMMANDS = { inventory, fetch: fetchCmd, plan: planCmd, selftest, status, 
                    apply: applyCmd, undo: undoCmd, submit: submitCmd, 'submit-introdb': submitIdbCmd };
 if (!COMMANDS[cmd]) {
     console.log('usage: tidb-sync.mjs inventory | fetch [--source tidb|introdb] [--budget N] | plan [--policy fill|prefer-tidb] [--no-chapters] [--no-introdb] [--no-fingerprint]\n'
+        + '                     plan/apply also: [--no-commercials] [--commercial-sections "Sports,4"]\n'
         + '                     selftest | status | sources\n'
         + '                     apply --yes [--live] [--limit N] [--match TEXT] [--policy ...] [--no-recap] [--no-preview]\n'
         + '                     undo <file> --yes [--live]\n'
-        + '                     submit [--yes] [--limit N] [--json]           (Plex-detected intros -> TheIntroDB; dry run without --yes)\n'
+        + '                     submit [--yes] [--limit N] [--segment intro|credits] [--json]   (Plex-detected intros + credits -> TheIntroDB; dry run without --yes)\n'
         + '                     submit-introdb [--yes] [--limit N] [--json]   (Plex-detected intros/credits -> introdb.app; dry run without --yes)');
     process.exit(cmd ? 1 : 0);
 }

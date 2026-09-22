@@ -110,6 +110,8 @@ function planArgs() {
     if (!S.get('INTRODB_ENABLED')) a.push('--no-introdb');
     if (!S.get('PAL_GUARD')) a.push('--no-pal-guard');
     if (!S.get('FP_ENABLED')) a.push('--no-fingerprint');
+    if (!S.get('COMMERCIALS_ENABLED')) a.push('--no-commercials');
+    a.push('--commercial-sections', S.get('COMMERCIALS_SECTIONS'));
     return a;
 }
 const applySteps = () => [['selftest'], ['apply', '--yes', '--live', '--keep-backups', String(S.get('KEEP_BACKUPS')), ...planArgs()]];
@@ -158,6 +160,12 @@ function runChain(trigger) {
     if (S.get('INTRODB_ENABLED')) steps.push(['fetch', '--source', 'introdb', '--budget', String(S.get('INTRODB_BUDGET'))]);
     steps.push(['plan', '--show', '0', ...planArgs()]);
     if (S.get('APPLY_ENABLED')) steps.push(...applySteps());
+    // Submitting comes last: it only ever offers markers Plex detected itself, and only when a key is set (the tool
+    // exits non-zero without one, which would fail the whole chain).
+    if (S.get('SUBMIT_TIDB_AUTO') && (S.secretIsSet('tidb_api_key') || fs.existsSync(CONFIG_KEY)))
+        steps.push(['submit', '--yes', '--limit', String(S.get('SUBMIT_TIDB_LIMIT'))]);
+    if (S.get('SUBMIT_INTRODB_AUTO') && S.secretIsSet('introdb_api_key'))
+        steps.push(['submit-introdb', '--yes', '--limit', String(S.get('SUBMIT_INTRODB_LIMIT'))]);
     const ok = runSteps('daily chain', trigger, steps);
     if (!ok) log(`${trigger} run skipped: busy with ${running}`);
     return ok;

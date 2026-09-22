@@ -94,7 +94,7 @@ ${fingerprintCard(c)}
 function chips(s) {
     const pills = [['Writing', s.APPLY_ENABLED ? 'on' : 'off', s.APPLY_ENABLED], ['TheIntroDB', s.TIDB_ENABLED ? 'on' : 'off'],
                    ['chapters', s.CHAPTERS_ENABLED ? 'on' : 'off'], ['introdb.app', s.INTRODB_ENABLED ? 'on' : 'off'],
-                   ['fingerprint', s.FP_ENABLED ? 'on' : 'off'], ['PAL guard', s.PAL_GUARD ? 'on' : 'off'], ['policy', s.POLICY], ['daily', s.RUN_AT]];
+                   ['fingerprint', s.FP_ENABLED ? 'on' : 'off'], ['commercials', s.COMMERCIALS_ENABLED ? s.COMMERCIALS_SECTIONS : 'off'], ['PAL guard', s.PAL_GUARD ? 'on' : 'off'], ['auto-submit', [s.SUBMIT_TIDB_AUTO ? 'TheIntroDB' : null, s.SUBMIT_INTRODB_AUTO ? 'introdb.app' : null].filter(Boolean).join(' + ') || 'off'], ['policy', s.POLICY], ['daily', s.RUN_AT]];
     return pills.map(([k, v, w]) => `<span class="pill${w ? ' warn' : ''}">${esc(k)}: ${esc(v)}</span>`).join('');
 }
 
@@ -271,7 +271,7 @@ export function submitPage(c) {
         const keyOk = isT ? c.hasTidbKey : c.secrets.introdb_api_key;
         const cands = d?.candidates ?? [];
         const rules = isT
-            ? 'Sends intros Plex detected itself, on episodes Plex matched to a TMDB episode, 5–200 s long, with the real file length so TheIntroDB can match the cut. Paced at 25 requests per 10 s (TheIntroDB OK\'d bulk submission under 40/10 s).'
+            ? 'Sends intros and end credits Plex detected itself, on episodes Plex matched to a TMDB episode (intros 5–200 s, credits 5 s–30 min), with the real file length so TheIntroDB can match the cut. Credits that run to the end of the file are sent with an open end, their own convention. PAL-speed files are only sent with a file length. Paced at 25 requests per 10 s (TheIntroDB OK\'d bulk submission under 40/10 s); their limit is 1,000 submissions a day.'
             : 'Sends intros and end credits (as "outro") Plex detected itself, with the series IMDb id and season/episode (movies: credits only). PAL-speed (25 fps) files are skipped because introdb.app entries carry no file length. Paced at 1 per second; introdb.app allows 1 submission per segment per episode every 5 minutes.';
         const skipped = isT ? (d ? `${n(d.skippedIntroSyncWritten)} markers IntroSync wrote were excluded.` : '')
             : (d?.skipped ? `Excluded: ${n(d.skipped.introsyncWritten)} written by IntroSync · ${n(d.skipped.pal)} PAL-speed · ${n(d.skipped.multiple)} with more than one marker · ${n(d.skipped.noImdb)} without an IMDb id · ${n(d.skipped.bounds)} out of bounds · ${n(d.skipped.alreadySent)} already sent.` : '');

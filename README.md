@@ -238,3 +238,40 @@ scan, it reads a few seconds of each episode and matches them against a **season
 - **By hand:** `docker exec IntroSync node /app/fingerprint.mjs status` · `selftest` ·
   `detect --validate 15` (blind test on episodes WITH known timings, compared, nothing written to Plex) ·
   `detect --dry-run --limit 5` (no detections stored).
+
+## Commercial markers from comskip chapters (`COMMERCIALS_ENABLED`, default on), added 2026-09-19
+User request, relayed by the recovery session: Sports recordings get "Skip Commercial" markers from the chapters the
+DVR trimmer leaves in them (Unmanic comchap: "Commercial 1..N" alternating with "Chapter N"). This keeps Unraid's
+comskip step worth its CPU.
+- **Scope:** the libraries in `COMMERCIALS_SECTIONS` (names or ids, default `Sports` = section 4). These items have
+  no TMDB id, so they're found straight from Plex, not the ledger. One-file items only.
+- **Mapping:** each "Commercial N" chapter becomes a `commercial` marker. Dropped: blips under 5 s and anything over
+  20 min, and a break at the very start or end (the trimmed pre/post padding, e.g. "Commercial 1" 0:00–0:52).
+  Back-to-back breaks merge.
+- **Written the way Plex's own DVR comskip writes them** (verified against item 85350): `taggings` text
+  `commercial`, `extra_data` NULL, indexed with the item's other markers; `pv:commercials` (marker array version
+  -1) in `media_parts.extra_data`.
+- **Plex's own commercial markers are never replaced.** Source `chapters` in the provenance. Same backup, undo and
+  session check as every apply; never submitted anywhere.
+- **Tested on a copy of the Plex DB:**
+  - apply wrote 22 markers on "Buffalo Bills vs Detroit Lions";
+  - the encoder selftest reproduced all 64,740 rows byte for byte;
+  - a re-plan found it up to date;
+  - undo restored it byte-identical.
+  First live plan: 3 recordings, 53 breaks, 30 s–7.8 min (median 2.2 min).
+
+## Submitting: credits + auto-submit (2026-09-21)
+- **TheIntroDB now gets credits too.** `submit` used to send only intros, though their API has accepted
+  `intro`/`recap`/`credits`/`preview` all along. Credits: start required, end omitted when the marker runs to the
+  end of the file (their convention for "to the end"), 5 s–30 min, with `video_duration_ms` when the versions agree.
+  PAL-speed files are only sent when that duration can be included. `--segment intro|credits` limits a run.
+  First batch of 5 credits accepted 2026-09-21. Candidates then: 2,469 credits + 2 intros.
+- **introdb.app caps submissions at 100 per hour per account** (429 `{"error":"Rate limit exceeded","limit":100,
+  "reset_at":…}`), which is NOT the documented per-episode limit. A manual run on 2026-09-21 sent 98 and then burned
+  201 requests on refusals. Now three 429s in a row stop the run and log their reset time.
+- **Auto-submit in the daily chain** (after apply, last): `SUBMIT_TIDB_AUTO` + `SUBMIT_TIDB_LIMIT` (default 400;
+  their limit is 1,000/day) and `SUBMIT_INTRODB_AUTO` + `SUBMIT_INTRODB_LIMIT` (default 100 = their hourly cap).
+  A step is only added when that service's key is set, since the tool exits non-zero without one and would fail the
+  chain. Both were switched on for this install on 2026-09-21.
+- Unchanged: only markers **Plex detected itself** are ever submitted. Nothing IntroSync wrote goes out, including
+  fingerprint detections.

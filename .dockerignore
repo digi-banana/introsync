@@ -1,10 +1,5 @@
-.git
-data
-backups
-config
-secrets
+# Build context: only the Dockerfile and app/ are needed. Keep data, secrets, Plex DB backups and code backups out.
+data/
+backups/
+config/
 **/*.bak*
-unraid
-*.md
-icon.png
-make-icon.mjs
