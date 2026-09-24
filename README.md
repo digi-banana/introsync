@@ -275,3 +275,58 @@ comskip step worth its CPU.
   chain. Both were switched on for this install on 2026-09-21.
 - Unchanged: only markers **Plex detected itself** are ever submitted. Nothing IntroSync wrote goes out, including
   fingerprint detections.
+
+## Where the files are read from, and how the search works (2026-09-22)
+**`FP_READ_SOURCE`: `filesystem` (default) or `webdav`.**
+- `filesystem`: read each file where Plex sees it, through the debrid mounts. Nothing to configure, no password,
+  works whatever backend holds the file.
+- `webdav`: ask InfiniDysk / decypharr for exact byte ranges instead. Needs the WebDAV password.
+- Both go through the same local proxy, so byte accounting and ffmpeg behaviour are identical.
+- **Measured 2026-09-22, 64 s of audio from one episode:** 34 MB downloaded via bounded WebDAV ranges, **663 MB**
+  through the rclone mount (a seek makes it keep pulling; merely opening the file cost 401 MB). The mount read also
+  starved InfiniDysk while it ran: the live worker hit its 5-read-errors circuit breaker at the same moment. This
+  install therefore runs `webdav`; the shipped default is `filesystem` so a fresh install needs no setup.
+
+**Intro search: fewer, larger reads.** The old ladder probed 8 s, then read again to confirm. Now:
+- One 16 s read at the most likely position, checked as two halves that must agree: self-confirming, one read.
+- **Long intros (>= 40 s): sparse 16 s probes**, spaced about an intro apart. A long intro is a big target, so a probe
+  only has to land inside it, and this covers minutes cheaply.
+- **Short intros: one contiguous window**, with two slices of the reference slid across it, so every start in the
+  window is tested. Sparse probes fall through the gaps when the intro is short (Reacher: 15 s intros over 3 min).
+- Budgets are in both seconds and bytes, so a 40 Mbit/s remux can't burn the budget in one read; window length adapts
+  to the file's bitrate.
+- **Contiguous reads cost 2-2.5x less per second of audio than scattered ones** (InfiniDysk fetches whole Usenet
+  articles, so every separate read pays that again): 8 x 8 s scattered = 70 MB / 294 MB (web / Blu-ray), one 64 s
+  contiguous read = 34 MB / 155 MB.
+- **Blind test:** 8/9 matched, median error 1.09 s, 105 MB per episode. On the same Last of Us episodes as the old
+  ladder: same 5/6 matches for 857 MB instead of 1,240 MB.
+
+## Seedless intros: shows nothing knows yet (`FP_SEEDLESS`, default on), added 2026-09-24
+Until now detection needed a **seed**: one episode in the season whose intro was already known (a Plex marker or
+TheIntroDB). That left out every show neither knows - 2,063 seasons / 26,199 episodes here, e.g. "Kung Fu: The Legend
+Continues", which TheIntroDB has nothing for (404 by both TVDB and IMDb id).
+
+**How:** compare two episodes of the season to EACH OTHER and take the longest stretch of audio they share near the
+start (`sharedRuns` in detector.mjs). Their stories differ, so a long shared run can only be repeated material. The
+derived intro is stored per season+release in `seeds` and then used exactly like any other seed, so the rest of the
+season follows the normal cheap path.
+
+**Guards, each one earned in testing:**
+- At least 25 s, or **30 s if it starts at 0:00**: FROM S3 derived a 15 s run there, which was the network ident, and
+  accepting it hid the real 118 s title sequence.
+- A variety check: silence and test patterns "match" everywhere, so a near-constant run is rejected.
+- The derived end is **trimmed by 5 s**. Ends came out 3-5 s past the real ones (episodes share a beat of the next
+  scene); a short Skip button costs nothing, skipping story does. After the trim: 0 of 9 ends skipped story.
+- Only the START is extended over a loose-matching fade; extending the end that way caused the late ends above.
+- Each episode's own end is then measured from the audio, as for premieres and cross-season references.
+
+**Blind test** (`--force-seedless` hides every known intro, so nothing is known):
+- FROM S1: derived 115 s from E2+E4; E1 landed within 3.7 s of its real intro, on the safe side.
+- Nurse Jackie S1-S3, four season/release combinations: derived ~48-51 s each; 7 episodes matched, starts 0.1-5.3 s
+  late (harmless), **no end skipped story**.
+- Declined rather than guessing: The Simpsons S37 (its "intro" is a 5-13 s title card), FROM S2/S3, The Terror S2.
+- Found a data error: TheIntroDB lists FROM S1E2/E3 intros as starting at 0:00, but the title sequence is at 2:30 and
+  5:00 (E1's own entry is at 7:34). Our detection is the correct one there.
+
+**Cost:** two reads of the opening minutes per season and release, once (window adapts to bitrate, ~180 MB each).
+Across the ~2,000 unseeded seasons that is a few hundred GB of Usenet, spread over the worker's rounds.

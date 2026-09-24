@@ -7,6 +7,7 @@
 //   refs         reference fingerprints per (file, size, speed factor): each season's reference is read ONCE, ever
 //   sib_credits  raw credits detection on siblings with known credits (the calibration inputs), per file
 //   sib_cards    12 s of 64x36 thumbnails around a sibling's known credits start (the stills method's reference)
+//   seeds        intros derived by comparing two episodes of a season that has no known intro at all (seedless)
 //   detections   every outcome per (episode, intro|credits), keyed to the file (path + size): matches are what the
 //                plan uses as source "fingerprint"; misses are retried only on a new file, a new detector VERSION,
 //                or after 30 days (1 day for read errors)
@@ -30,7 +31,7 @@
 //
 // usage: fingerprint.mjs detect [--max-minutes 60] [--limit N] [--show TEXT] [--dry-run] [--no-credits]
 //                               [--no-chapters] [--no-introdb] [--no-recap] [--no-preview] [--dav-url U] [--dav-user U]
-//        fingerprint.mjs detect --validate N [--show TEXT]      (blind test on episodes with known timings)
+//        fingerprint.mjs detect --validate N [--show TEXT] [--force-seedless]   (blind test on episodes with known timings)
 //        fingerprint.mjs status [--json]  |  selftest
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
@@ -56,6 +57,7 @@ export const CFG = {
     davUser: opt('dav-user', process.env.FP_WEBDAV_USER || 'admin'),
     davPassFile: process.env.INFINIDYSK_PASSWORD_FILE || path.join(DATA, 'secrets', 'infinidysk_password'),
     decypharrUrl: String(opt('decypharr-url', process.env.FP_DECYPHARR_URL || 'http://192.168.0.100:28282')).replace(/\/+$/, ''),
+    readSource: opt('read-source', process.env.FP_READ_SOURCE || 'filesystem'),   // filesystem | webdav
     debridRoot: process.env.DEBRID_ROOT || '/mnt/debrid',
 };
 const FP_FORMAT = 1;               // stored reference fingerprint format
@@ -69,6 +71,15 @@ const STILL_FPS = 4, CARD_MIN = 0.8, CARD_MARGIN = 0.2, CARD_AGREE_S = 1.5, CARD
 // Where the "first text frame" method gives up, the stills method gets a second chance.
 const STILLS_FOR = new Set(['calibration-disagrees', 'no-calibration', 'off-pattern', 'no-credits-block', 'no-start-edge', 'implausible']);
 const SIB_VERSION = 6;             // how sibling calibrations are measured (hint from the OTHER siblings since v6)
+const SEED_VERSION = 1;            // how seedless intros are derived
+const SEED_BYTES = 180e6, SEED_MIN_S = 90, SEED_MAX_S = 300, SEED_MIN_LEN = 25, SEED_MAX_LEN = 200;
+// Distributor and network idents are repeated material too, and they sit at 0:00: FROM S3 derived a 15 s run there
+// (the network sting) and that stopped the real 118 s title sequence being found. A run that starts at the very
+// beginning has to be long enough to be a title sequence, not an ident.
+const SEED_AT_START_LEN = 30;
+// A derived intro ends where two episodes stop sounding alike, which measured 3-5 s past where the markers really end
+// (the episodes share a beat of the next scene). Ending early only shortens the Skip button; ending late skips story.
+const SEED_END_TRIM = 5;
 const RETRY = { miss: 30 * DAY, 'read-error': DAY };
 // A round stops after this many episodes in a row that couldn't be read (backend down): don't mark the library "missed".
 const MAX_FAILED_EPISODES = 5;
@@ -91,6 +102,9 @@ export function openStore(file = CFG.store) {
         CREATE TABLE IF NOT EXISTS validation(run TEXT, mid INTEGER, kind TEXT, label TEXT, status TEXT, start REAL, "end" REAL,
             truth_start REAL, truth_end REAL, err REAL, detail TEXT, bytes INTEGER, at INTEGER);
         CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT);`);
+    // A season with no known intro anywhere gets one derived by comparing two of its episodes to each other.
+    db.exec(`CREATE TABLE IF NOT EXISTS seeds(season_id INTEGER, rel TEXT, file TEXT, size INTEGER, start REAL, "end" REAL,
+                 ber REAL, pair TEXT, status TEXT, version INTEGER, created INTEGER, PRIMARY KEY(season_id, rel))`);
     db.exec(`CREATE TABLE IF NOT EXISTS sib_cards(file TEXT, size INTEGER, truth REAL, t0 REAL, fps REAL, n INTEGER, frames BLOB, version INTEGER,
                  created INTEGER, PRIMARY KEY(file, size))`);
     for (const [t, c] of [['sib_credits', 'hint REAL'], ['reads', 'rd_bytes INTEGER DEFAULT 0']]) {
@@ -236,7 +250,7 @@ async function davCheck(password) {
 async function detectCmd() {
     const t0 = Date.now();
     const o = { useChapters: !flag('no-chapters'), useIntrodb: !flag('no-introdb'), mapRecap: !flag('no-recap'), mapPreview: !flag('no-preview'),
-                credits: !flag('no-credits'), dryRun: flag('dry-run'), validate: Number(opt('validate', 0)), show: opt('show', null),
+                credits: !flag('no-credits'), seedless: !flag('no-seedless'), forceSeedless: flag('force-seedless'), dryRun: flag('dry-run'), validate: Number(opt('validate', 0)), show: opt('show', null),
                 limit: Number(opt('limit', 0)), maxMs: Number(opt('max-minutes', 60)) * 60_000, only: opt('only', null) };
     const summary = { intro: {}, credits: {}, skipped: {}, bytes: 0, episodes: 0, refsBuilt: 0, calibMeasured: 0, cardsMeasured: 0, stopped: null, queue: null };
     const finish = (stopped) => {
@@ -245,14 +259,17 @@ async function detectCmd() {
         log('fingerprint', o.validate ? 'validate' : 'detect', 'finished:', stopped);
         console.log(JSON.stringify(summary));
     };
+    const viaWebdav = CFG.readSource === 'webdav';
     let password = null;
-    try { password = fs.readFileSync(CFG.davPassFile, 'utf8').trim() || null; } catch { }
-    if (!password) return finish('no-password');
-    const dav = await davCheck(password);
-    if (dav !== 'ok') return finish(dav);
+    if (viaWebdav) {
+        try { password = fs.readFileSync(CFG.davPassFile, 'utf8').trim() || null; } catch { }
+        if (!password) return finish('no-password');
+        const dav = await davCheck(password);
+        if (dav !== 'ok') return finish(dav);
+    }
 
     // Real-Debrid files (decypharr's WebDAV, no auth): optional. Unreachable = those files are skipped this round.
-    let decypharrUrl = CFG.decypharrUrl || null;
+    let decypharrUrl = viaWebdav ? (CFG.decypharrUrl || null) : null;
     if (decypharrUrl) {
         try {
             const r = await fetch(`${decypharrUrl}/webdav/`, { method: 'PROPFIND', headers: { Depth: '0' }, signal: AbortSignal.timeout(10_000) });
@@ -261,13 +278,17 @@ async function detectCmd() {
     }
     const lib = loadLibrary(o);
     const S = openStore();
-    const rd = await D.createReader({ davUrl: CFG.davUrl, davUser: CFG.davUser, davPassword: password, decypharrUrl, debridRoot: CFG.debridRoot });
+    const rd = await D.createReader({ mode: CFG.readSource, davUrl: CFG.davUrl, davUser: CFG.davUser, davPassword: password, decypharrUrl, debridRoot: CFG.debridRoot });
+    log(`reading via ${viaWebdav ? 'bounded WebDAV ranges' : 'the filesystem (mounts)'}`);
     const q = {
         ref: S.prepare('SELECT * FROM refs WHERE file = ? AND size = ? AND k = ?'),
         putRef: S.prepare(`INSERT OR REPLACE INTO refs(file, size, k, truth, intro_start, intro_len, zero_start, core0, core1, fp, format, created)
                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`),
         sib: S.prepare('SELECT * FROM sib_credits WHERE file = ? AND size = ?'),
         cards: S.prepare('SELECT * FROM sib_cards WHERE file = ? AND size = ?'),
+        seed: S.prepare('SELECT * FROM seeds WHERE season_id = ? AND rel = ?'),
+        putSeed: S.prepare(`INSERT OR REPLACE INTO seeds(season_id, rel, file, size, start, "end", ber, pair, status, version, created)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?)`),
         putCards: S.prepare('INSERT OR REPLACE INTO sib_cards(file, size, truth, t0, fps, n, frames, version, created) VALUES (?,?,?,?,?,?,?,?,?)'),
         putSib: S.prepare('INSERT OR REPLACE INTO sib_credits(file, size, truth, status, raw, version, created, hint) VALUES (?,?,?,?,?,?,?,?)'),
         det: S.prepare('SELECT * FROM detections WHERE mid = ? AND kind = ?'),
@@ -320,14 +341,48 @@ async function detectCmd() {
         return ok ? sib.truthCredits - r.start : null;
     }
 
+    // No known intro anywhere in the show: derive one by comparing two episodes of this season to each other.
+    // Their stories differ, so a long shared run near the start is repeated material - the title sequence (or a
+    // distributor logo, which is skippable too). Derived once per season and release, then used like any other seed.
+    async function deriveSeed(season, t, exclude) {
+        const rel = t.rel;
+        const row = q.seed.get(season.id, rel);
+        if (row && row.version === SEED_VERSION) {
+            if (row.status !== 'found') return null;
+            const ep = season.eps.find(e => e.file === row.file && e.size === row.size);
+            return ep ? { ...ep, truthIntro: { start: row.start, end: row.end, src: 'seedless' } } : null;
+        }
+        const pool = season.eps.filter(e => e !== t && e.ep !== 1 && !exclude.has(e.mid) && e.rel === rel && readable(e))
+            .sort((a, b) => a.ep - b.ep);
+        if (pool.length < 2) return null;
+        const [a, b] = [pool[0], pool[pool.length > 2 ? 2 : 1]];
+        const bytesPerS = a.size > 0 && a.dur > 0 ? a.size / a.dur : 0;
+        const span = Math.max(SEED_MIN_S, Math.min(SEED_MAX_S, bytesPerS > 0 ? SEED_BYTES / bytesPerS : SEED_MIN_S));
+        const fa = D.fingerprint(await rd.audio(rd.urlFor(a.file), 0, span));
+        const fb = D.fingerprint(await rd.audio(rd.urlFor(b.file), 0, span));
+        summary.seedsDerived = (summary.seedsDerived ?? 0) + 1;
+        const runs = D.sharedRuns(fa, fb).filter(r => r.len >= (r.aStart < 2 ? SEED_AT_START_LEN : SEED_MIN_LEN) && r.len <= SEED_MAX_LEN);
+        const best = runs[0] ?? null;
+        if (best) best.len = Math.max(SEED_MIN_LEN, best.len - SEED_END_TRIM);
+        const detail = `E${a.ep}+E${b.ep} span ${span.toFixed(0)}s${best ? ` run ${best.len.toFixed(1)}s ber ${best.ber}` : ' no run'}`;
+        q.putSeed.run(season.id, rel, a.file, a.size, best?.aStart ?? null, best ? best.aStart + best.len : null, best?.ber ?? null,
+                      detail, best ? 'found' : 'none', SEED_VERSION, now());
+        log(`  seedless ${t.show} S${season.season} [${rel}]: ${detail}`);
+        return best ? { ...a, truthIntro: { start: best.aStart, end: best.aStart + best.len, src: 'seedless' } } : null;
+    }
+
     async function doIntro(season, t, exclude) {
         const seedOk = (e) => e !== t && e.ep !== 1 && !exclude.has(e.mid) && e.truthIntro && readable(e);
-        let seeds = season.eps.filter(seedOk);
-        let cross = false;
-        if (!seeds.length) {
+        let seeds = o.forceSeedless ? [] : season.eps.filter(seedOk);     // --force-seedless: pretend nothing is known
+        let cross = false, seedless = false;
+        if (!seeds.length && !o.forceSeedless) {
             const others = lib.shows.get(season.showId).seasons.filter(s => s !== season && s.season > 0)
                 .sort((a, b) => Math.abs(a.season - season.season) - Math.abs(b.season - season.season));
             for (const s of others) { seeds = s.eps.filter(seedOk); if (seeds.length) { cross = true; break; } }
+        }
+        if (!seeds.length && o.seedless && readable(t)) {
+            const derived = await deriveSeed(season, t, exclude);
+            if (derived) { seeds = [derived]; seedless = true; cross = false; }
         }
         if (!seeds.length) return { status: 'skip', why: 'no-seed' };
         const lens = seeds.map(e => e.truthIntro.end - e.truthIntro.start).sort((a, b) => a - b), med = lens[Math.floor(lens.length / 2)];
@@ -341,10 +396,15 @@ async function detectCmd() {
         const hintStarts = [...starts, ...(cross ? [] : season.eps.filter(e => e !== t && !exclude.has(e.mid) && detected.has(e.mid)).map(e => detected.get(e.mid)))];
         const hints = D.hintsFor(hintStarts, ref.introStart);
         const premiere = t.ep === 1;
-        const measure = premiere || cross;
-        const r = await D.findIntro(rd, rd.urlFor(t.file), t.dur, ref, hints, premiere && ref.introLen >= 40 ? { budgetS: 160, maxReads: 20, measure } : { measure });
+        // Measure the end from the audio for seedless too: the derived length is an average of two episodes, and each
+        // episode's own title sequence may run slightly longer or shorter.
+        const measure = premiere || cross || seedless;
+        // Premieres search further: their intro often sits past everything else in the season (Peacemaker S2E1 at 7:06).
+        const bytesPerS = t.size > 0 && t.dur > 0 ? t.size / t.dur : 0;
+        const r = await D.findIntro(rd, rd.urlFor(t.file), t.dur, ref, hints,
+            premiere && ref.introLen >= 40 ? { budgetS: 700, byteBudget: 550e6, maxReads: 9, measure, bytesPerS } : { measure, bytesPerS });
         const detail = { how: r.how, reads: r.reads?.length ?? 0, readS: r.readS, ref: refEp.label, refRel: refEp.rel, refCached: !!ref.cached, k: +k.toFixed(4),
-                         cross, measuredStart: r.measuredStart, measuredEnd: r.measuredEnd, hints: hints.slice(0, 5).map(h => +h.toFixed(1)) };
+                         cross, seedless, measuredStart: r.measuredStart, measuredEnd: r.measuredEnd, hints: hints.slice(0, 5).map(h => +h.toFixed(1)) };
         if (r.status !== 'match') return { status: r.status === 'read-error' ? 'read-error' : 'miss', why: r.status, detail };
         if (r.end - r.start < 5 || r.start > t.dur * 0.5) return { status: 'miss', why: 'implausible', detail: { ...detail, start: r.start, end: r.end } };
         return { status: 'match', start: r.start, end: r.end, final: 0, detail };
@@ -448,7 +508,9 @@ async function detectCmd() {
     const shows = [...lib.shows.values()].filter(s => !showRx || showRx.test(s.title))
         .sort((a, b) => (b.viewed - a.viewed) || a.title.localeCompare(b.title));
     const hasSeed = (season, t) => season.eps.some(e => e !== t && e.ep !== 1 && e.truthIntro)
-        || lib.shows.get(season.showId).seasons.some(s => s !== season && s.season > 0 && s.eps.some(e => e.ep !== 1 && e.truthIntro));
+        || lib.shows.get(season.showId).seasons.some(s => s !== season && s.season > 0 && s.eps.some(e => e.ep !== 1 && e.truthIntro))
+        // seedless: two other episodes of the same release are enough to derive one
+        || (o.seedless && season.eps.filter(e => e !== t && e.ep !== 1 && e.rel === t.rel && e.file && !e.multi).length >= 2);
     const work = [];
     for (const sh of shows) for (const season of [...sh.seasons].sort((a, b) => a.season - b.season)) {
         if (season.season <= 0) continue;

@@ -16,7 +16,7 @@ import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import fs from 'node:fs';
 
-export const VERSION = 9;   // bump when detection changes: stored misses are retried on a new version
+export const VERSION = 12;   // bump when detection changes: stored misses are retried on a new version
 export const SR = 11025;
 const FRAME = 4096, HOP = 512;
 export const HOP_S = HOP / SR;
@@ -104,6 +104,68 @@ export function classify(px) {
 }
 const creditsLike = (s) => s === 'credits' || s === 'black';
 
+// ---------- seedless: what two episodes of a season have in common ----------
+// With no known intro anywhere in the season there is nothing to match against, so the intro is found by comparing two
+// episodes to EACH OTHER: the longest stretch of audio they share near the start. Their stories differ, so a long
+// shared run can only be repeated material - the title sequence, or a distributor logo / sponsor bumper, which are
+// skippable too. It cannot mark story as an intro, which is what makes this safe without a seed.
+// A and B are fingerprints of the first minutes of two episodes. Returns shared runs, longest first, as
+// { aStart, bStart, len, ber } in seconds.
+export function sharedRuns(A, B, { minS = 15, maxBits = 9, coarse = 4, maxRuns = 4, gapS = 0.7 } = {}) {
+    const minF = Math.round(minS / HOP_S), gapF = Math.round(gapS / HOP_S);
+    if (A.length < minF || B.length < minF) return [];
+    // Score each shift by its longest run of close frames. Real audio spikes now and then (an edit, a loud effect),
+    // so a run bridges up to `gapS` of mismatching frames instead of ending there.
+    const score = (shift, step) => {
+        const from = Math.max(0, -shift), to = Math.min(A.length, B.length - shift);
+        let best = 0, run = 0, bad = 0, bestEnd = 0;
+        for (let i = from; i < to; i += step) {
+            if (pop(A[i] ^ B[i + shift]) <= maxBits) { bad = 0; run += step; if (run > best) { best = run; bestEnd = i + step; } }
+            else if (run > 0 && (bad += step) <= gapF) run += step;
+            else { run = 0; bad = 0; }
+        }
+        return { len: best, end: bestEnd };
+    };
+    const shifts = [];
+    for (let s = -(B.length - minF); s <= A.length - minF; s += coarse) {
+        const r = score(s, coarse);
+        if (r.len >= minF * 0.6) shifts.push({ shift: s, len: r.len });
+    }
+    shifts.sort((a, b) => b.len - a.len);
+    const out = [];
+    for (const cand of shifts.slice(0, 12)) {
+        let best = null;
+        for (let s = cand.shift - coarse; s <= cand.shift + coarse; s++) {   // refine at full resolution
+            const r = score(s, 1);
+            if (!best || r.len > best.len) best = { ...r, shift: s };
+        }
+        if (!best || best.len < minF) continue;
+        let aEnd = best.end, aStart = aEnd - best.len;
+        // Mean error over the run, and a variety check: silence and test patterns also "match" everywhere.
+        let err = 0, varied = 0;
+        for (let i = aStart; i < aEnd; i++) {
+            err += pop(A[i] ^ B[i + best.shift]);
+            if (i > aStart && pop(A[i] ^ A[i - 1]) > 2) varied++;
+        }
+        const ber = err / (32 * best.len);
+        if (varied < best.len * 0.5) continue;                                // near-constant audio: not a title sequence
+        // A title sequence fades in and out over whatever the episode was doing, so its first and last seconds match
+        // only loosely and the strict run stops short of them (Nurse Jackie: every episode came out ~5 s late at both
+        // ends). Walk outward while frames are still reasonably close, up to a few seconds.
+        // Only the START is extended: a late start just delays the Skip button, whereas a late END would skip story,
+ 	// and extending the end loosely did exactly that (Nurse Jackie ends came out 3-5 s past the real ones).
+        const loose = maxBits + 6, edgeF = Math.round(6 / HOP_S);
+        let lo = aStart;
+        for (let n = 0; n < edgeF && lo > 0 && lo + best.shift > 0 && pop(A[lo - 1] ^ B[lo - 1 + best.shift]) <= loose; n++) lo--;
+        best.len = aEnd - lo; aStart = lo;
+        const run = { aStart: aStart * HOP_S + FP0, bStart: (aStart + best.shift) * HOP_S + FP0, len: best.len * HOP_S, ber: +ber.toFixed(3) };
+        if (out.some(o => Math.abs(o.aStart - run.aStart) < 5)) continue;     // same run found again at a nearby shift
+        out.push(run);
+        if (out.length >= maxRuns) break;
+    }
+    return out.sort((a, b) => b.len - a.len);
+}
+
 // ---------- stills (credits cards) ----------
 // The first seconds of end credits are usually the same cards every episode (live action: 0.9-1.0 correlation between
 // episodes, ~0 against the scene before; FINDINGS-v5). A sibling's 8 s card SEQUENCE, slid along the target, pins the
@@ -167,7 +229,7 @@ export const speedOf = (refFps, tgtFps) => (isPal(tgtFps) && isFilm(refFps)) ? 2
 // - decypharr (Real-Debrid): /mnt/debrid/decypharr/<p> -> <decypharrUrl>/webdav/<p>, no auth. Measured ~1x
 //   (1 MiB range -> 1 MB, 16 MiB -> 18 MB of decypharr downloads).
 // A backend without a URL (or InfiniDysk without a password) is simply not readable: those files are skipped.
-export async function createReader({ davUrl, davUser, davPassword, decypharrUrl, debridRoot = '/mnt/debrid' }) {
+export async function createReader({ mode = 'filesystem', davUrl, davUser, davPassword, decypharrUrl, debridRoot = '/mnt/debrid' }) {
     const auth = davPassword ? 'Basic ' + Buffer.from(`${davUser}:${davPassword}`).toString('base64') : null;
     const backends = [
         { name: 'infinidysk', prefix: `${debridRoot}/infinidysk/`, base: davUrl, auth, on: !!(davUrl && auth) },
@@ -175,11 +237,22 @@ export async function createReader({ davUrl, davUser, davPassword, decypharrUrl,
     ];
     const sources = new Map(), urls = new Map(), audioMaps = new Map();
     // authErrors: the backend refused the login (401/403) mid-run, e.g. its WebDAV password was changed; callers stop.
-    const stat = { bytes: 0, readErrors: 0, authErrors: 0, by: { infinidysk: 0, decypharr: 0 } };
+    const stat = { bytes: 0, readErrors: 0, authErrors: 0, by: { infinidysk: 0, decypharr: 0, filesystem: 0 } };
     const server = createServer(async (req, res) => {
         const src = sources.get(decodeURIComponent(req.url.slice(1)));
         if (!src) { res.writeHead(404); return res.end(); }
         const m = /bytes=(\d+)-(\d*)/.exec(req.headers.range ?? '');
+        if (src.local) {                                        // filesystem mode: the mount serves the bytes
+            let size; try { size = fs.statSync(src.local).size; } catch { stat.readErrors++; res.writeHead(502); return res.end(); }
+            const start = m ? +m[1] : 0, end = m && m[2] ? +m[2] : size - 1;
+            res.writeHead(m ? 206 : 200, { 'Accept-Ranges': 'bytes', 'Content-Length': end - start + 1, ...(m ? { 'Content-Range': `bytes ${start}-${end}/${size}` } : {}) });
+            const s = fs.createReadStream(src.local, { start, end, highWaterMark: 256 * 1024 });
+            s.on('data', (c) => { stat.bytes += c.length; stat.by.filesystem += c.length; });
+            s.on('error', () => { stat.readErrors++; res.destroy(); });
+            s.pipe(res);
+            res.on('close', () => s.destroy());
+            return;
+        }
         let closed = false; const ac = new AbortController();
         res.on('close', () => { closed = true; ac.abort(); });
         try {
@@ -212,9 +285,23 @@ export async function createReader({ davUrl, davUser, davPassword, decypharrUrl,
     const port = server.address().port;
 
     // A URL ffmpeg can read for this Plex file path, or null (no readable backend / not resolvable).
+    // filesystem mode reads the file where Plex sees it (through the debrid mounts); webdav mode goes to the backend's
+    // own WebDAV in bounded ranges, which downloads ~20x less (measured 2026-09-22: 64 s of audio = 34 MB via WebDAV,
+    // 663 MB through the rclone mount, which also starves the mount for everything else).
     function urlFor(file) {
         if (urls.has(file)) return urls.get(file);
         let u = null;
+        if (mode === 'filesystem') {
+            let target = file;
+            try { target = fs.readlinkSync(file); } catch { }
+            if (fs.existsSync(target)) {
+                const id = String(sources.size);
+                sources.set(id, { local: target });
+                u = `http://127.0.0.1:${port}/${id}`;
+            }
+            urls.set(file, u);
+            return u;
+        }
         try {
             const t = fs.readlinkSync(file);
             const b = backends.find(x => x.on && t.startsWith(x.prefix));
@@ -309,13 +396,38 @@ async function measureEdge(rd, url, ref, shift, pred, which) {
     return [edge == null ? null : w0 + FP0 + edge * HOP_S, len];
 }
 
+// Slide a slice of the reference intro across one CONTIGUOUS window of the target: finds a start anywhere in the
+// window, and a second slice confirms it without another read. Measured 2026-09-21: contiguous reads cost 2-2.5x less
+// per second of audio than scattered snippets (InfiniDysk fetches whole Usenet articles, so every separate read pays
+// that overhead again), and they cover every position instead of one point per read.
+// Returns { start, how, shift } or null. The window must be [w0, w0 + span] of already-read audio.
+export const SLICE_S = 16, SLICE_AT_S = 2;                      // the two reference slices: 2 s and 18 s into the intro
+export const WINDOW_TAIL_S = SLICE_AT_S + 2 * SLICE_S;          // audio needed after the last candidate start
+function scanWindow(ref, F, w0) {
+    const SLICE = Math.round(Math.min(SLICE_S, Math.max(8, (ref.introLen - 4) / 2)) / HOP_S);
+    const first = ref.core[0] + Math.round(SLICE_AT_S / HOP_S);
+    if (ref.core[1] - first < 2 * SLICE) return null;           // intro too short to take two slices from
+    const at = [first, first + SLICE];
+    const starts = [];
+    for (const a of at) {
+        const m = locate(F, ref.R.subarray(a, a + SLICE));
+        if (!m.ok) return null;
+        const offsetInIntro = (FP0 + a * HOP_S) - ref.introStart;   // where this slice sits inside the intro
+        starts.push({ start: w0 + FP0 + m.pos * HOP_S - offsetInIntro, ber: m.ber });
+    }
+    if (Math.abs(starts[0].start - starts[1].start) > 0.4) return null;   // the two slices disagree: not a real match
+    const start = (starts[0].start + starts[1].start) / 2;
+    return { start, ber: Math.max(...starts.map(s => s.ber)) };
+}
+
 // hints: known intro starts of the season in the target's timeline, most common first.
-// opts.budgetS: seconds of media read (80; premieres 160); opts.maxReads (10; premieres 20); opts.measure: measure the
-// end from the audio (premieres, pilots, cross-season references).
-export async function findIntro(rd, url, durS, ref, hints, { budgetS = 80, maxReads = 10, measure = false } = {}) {
+// opts.budgetS: seconds of media read (80; premieres 160); opts.measure: measure the end from the audio (premieres,
+// pilots, cross-season references). opts.mbPerS: the file's size per second, to keep one window's bytes sane.
+export async function findIntro(rd, url, durS, ref, hints, { budgetS = 400, byteBudget = 420e6, maxReads = 8, measure = false, bytesPerS = 0 } = {}) {
     const L = ref.introLen, b0 = rd.stat.bytes, reads = [];
     let readS = 0;
-    const fits = (s) => readS + s <= budgetS && rd.stat.bytes - b0 < BYTE_SANITY;
+    // Both budgets matter: seconds bound how much media is examined, bytes bound what that costs on a 40 Mbit/s remux.
+    const fits = (s) => readS + s <= budgetS && rd.stat.bytes - b0 + s * bytesPerS <= byteBudget && rd.stat.bytes - b0 < BYTE_SANITY;
     const done = async (start, how, shift) => {
         let end = start + L, measuredEnd = false, measuredStart = false;
         if (measure && shift != null) {
@@ -348,29 +460,52 @@ export async function findIntro(rd, url, durS, ref, hints, { budgetS = 80, maxRe
         reads.push([+t0.toFixed(1), +r.a.ber.toFixed(3), +r.b.ber.toFixed(3), r.agree ? 'agree' : 'x2']);
         if (r.agree) return done(r.start, 'halves', r.start - ref.introStart);
     }
-    const step = Math.max(10, Math.min(60, L - SNIP_S - 2)), cap = Math.min(720, durS * 0.4), mid = hints[0] + L / 2 - SNIP_S / 2;
-    const sched = hints.slice(1, 3).map(h => h + L / 2 - SNIP_S / 2);
-    for (let i = 1; sched.length < maxReads * 2; i++) {
-        const d = Math.ceil(i / 2) * step, t = mid + (i % 2 ? d : -d);
-        if (mid - d < 0 && mid + d > cap) break;
-        if (t >= 0 && t <= cap - SNIP_S) sched.push(t);
+    // Missed at the top hint. Two ways to keep looking, and which one wins depends on how long the intro is:
+    // - A LONG intro (>= 40 s) is a big target: sparse 16 s probes spaced about an intro apart cover minutes cheaply,
+    //   because a probe only has to land somewhere inside it. Measured on The Last of Us (80 s intros, 18 Mbit/s):
+    //   probes found them, contiguous windows spent the same bytes covering a fraction of the range and missed.
+    // - A SHORT intro needs contiguous coverage, since sparse probes fall through the gaps (Reacher: 15 s intros
+    //   scattered over 3 minutes). One window tests every start inside it for about the cost of two probes.
+    const WIN_BYTES = 150e6;
+    const total = Math.max(52, Math.min(216, bytesPerS > 0 ? WIN_BYTES / bytesPerS : 150));
+    const range = total - WINDOW_TAIL_S;                        // candidate starts a window covers
+    const cap = Math.min(720, durS * 0.4);
+    const spots = [];                                           // window mode: [from, span]; probe mode: [at, 2 * SNIP_S]
+    if (range >= 20 && L < 40) {
+        for (const h of hints.slice(0, 3)) spots.push([Math.max(0, h - range / 3), total]);
+        for (let i = 1; spots.length < 8; i++) {
+            const d = Math.ceil(i / 2) * range, s = hints[0] + (i % 2 ? d : -d);
+            if (hints[0] - d < 0 && hints[0] + d > cap) break;
+            if (s >= 0 && s <= cap) spots.push([s, total]);
+        }
+    } else {
+        for (const h of hints.slice(1, 4)) spots.push([Math.max(0, h + L / 2 - SNIP_S), 2 * SNIP_S]);
+        for (let i = 1; spots.length < 8; i++) {
+            const d = Math.ceil(i / 2) * Math.max(30, L), s = hints[0] + L / 2 - SNIP_S + (i % 2 ? d : -d);
+            if (hints[0] - d < 0 && hints[0] + d > cap) break;
+            if (s >= 0 && s <= cap) spots.push([s, 2 * SNIP_S]);
+        }
     }
-    for (const t of sched) {
-        if (reads.length >= maxReads || !fits(SNIP_S)) break;
-        const pcm = await rd.audio(url, t, SNIP_S); readS += SNIP_S;
-        if (pcm.length < SR * SNIP_S * 0.8) { reads.push([+t.toFixed(1), 'read-error']); if (reads.filter(x => x[1] === 'read-error').length >= 2) return { status: 'read-error', reads, readS }; continue; }
-        const m = locate(ref.R, fingerprint(pcm), ref.core);
-        reads.push([+t.toFixed(1), +m.ber.toFixed(3), +m.second.toFixed(3)]);
-        if (!m.ok) continue;
-        const shift = t + FP0 - (m.pos * HOP_S + FP0), pred = [ref.introStart + shift, ref.introStart + L + shift];
-        const cands = [pred[0] + 0.65 * L - SNIP_S / 2, t + SNIP_S, t - SNIP_S, pred[0] + 0.15 * L].map(x => Math.max(0, x));
-        const tc = cands.find(x => Math.abs(x - t) >= SNIP_S * 0.75 && x >= pred[0] - 1 && x + SNIP_S <= pred[1] + 1) ?? cands[3];
-        const m2 = locate(ref.R, fingerprint(await rd.audio(url, tc, SNIP_S)), ref.core); readS += SNIP_S;
-        const shift2 = tc + FP0 - (m2.pos * HOP_S + FP0);
-        reads.push([+tc.toFixed(1), +m2.ber.toFixed(3), +m2.second.toFixed(3), 'confirm']);
-        if (m2.pos >= 0 && m2.ber < 0.40 && Math.abs(shift2 - shift) < 0.3) return done(pred[0], 'snippets', shift);
+    for (const [from, span] of spots) {
+        if (reads.length >= maxReads || !fits(span)) break;
+        const pcm = await rd.audio(url, from, span); readS += span;
+        if (pcm.length < SR * span * 0.5) {
+            reads.push([+from.toFixed(1), 'read-error']);
+            if (reads.filter(x => x[1] === 'read-error').length >= 2) return { status: 'read-error', reads, readS };
+            continue;
+        }
+        const F = fingerprint(pcm);
+        if (span > 2 * SNIP_S) {                                // window: slide the reference slices across it
+            const m = scanWindow(ref, F, from);
+            reads.push([+from.toFixed(1), +span.toFixed(0), m ? +m.ber.toFixed(3) : null, 'window']);
+            if (m) return done(m.start, 'window', m.start - ref.introStart);
+        } else {                                                // probe: the same two-halves test as the first read
+            const r = halvesAgree(ref, F, from);
+            reads.push([+from.toFixed(1), +r.a.ber.toFixed(3), +r.b.ber.toFixed(3), r.agree ? 'agree' : 'x2']);
+            if (r.agree) return done(r.start, 'halves', r.start - ref.introStart);
+        }
     }
-    return { status: fits(SNIP_S) && reads.length < maxReads ? 'none' : 'budget', reads, readS };
+    return { status: fits(52) && reads.length < maxReads ? 'none' : 'budget', reads, readS };
 }
 
 // Raw credits block (uncalibrated). hintFromEnd: seconds before EOF where the season's credits usually start.
@@ -454,5 +589,17 @@ export function selftest() {
     const tgtS = { t0: 100, fps: 4, frames: Array.from({ length: 240 }, (_, i) => i / 4 < 23.5 ? noiseT() : cardAt(i / 4 - 23.5)) };
     const al = alignCards(sibS, tgtS);
     res.push(['stills alignment', !!al && Math.abs(al.start - 123.5) <= 0.25 && al.score > 0.9 && al.score - al.second > 0.3 && distinctive(sibS)]);
+    // seedless: two "episodes" sharing a 40 s title sequence at different offsets, with different story around it
+    const theme = music(40, 31);
+    const epA = fingerprint(cat(noise(12, 9000), theme, noise(40, 9000)));
+    const epB = fingerprint(cat(noise(35, 4000), theme, noise(30, 4000)));
+    const runs = sharedRuns(epA, epB);
+    const top = runs[0];
+    res.push(['seedless shared run', !!top && Math.abs(top.aStart - 12) < 1.5 && Math.abs(top.bStart - 35) < 1.5 && top.len > 35 && top.len < 48]);
+    // two episodes that share nothing must yield nothing
+    res.push(['seedless rejects unrelated', sharedRuns(fingerprint(noise(60, 9000)), fingerprint(noise(60, 4000))).length === 0]);
+    // silence in both is not a title sequence
+    res.push(['seedless rejects silence', sharedRuns(fingerprint(cat(noise(20, 9000), new Int16Array(SR * 30), noise(10, 9000))),
+                                                     fingerprint(cat(noise(10, 4000), new Int16Array(SR * 30), noise(20, 4000)))).length === 0]);
     return res;
 }

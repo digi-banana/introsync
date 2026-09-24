@@ -83,6 +83,7 @@ function childEnv() {
     return { ...process.env,
         PLEX_URL: S.get('PLEX_URL'),
         FP_WEBDAV_URL: S.get('FP_WEBDAV_URL'), FP_WEBDAV_USER: S.get('FP_WEBDAV_USER'), FP_DECYPHARR_URL: S.get('FP_DECYPHARR_URL'),
+        FP_READ_SOURCE: S.get('FP_READ_SOURCE'),
         TIDB_API_KEY_FILE: S.secretIsSet('tidb_api_key') ? S.secretPath('tidb_api_key') : CONFIG_KEY,
         INTRODB_API_KEY_FILE: S.secretPath('introdb_api_key'),
         INFINIDYSK_PASSWORD_FILE: S.secretPath('infinidysk_password') };
@@ -195,6 +196,7 @@ const FP_NEXT = { time: 5_000, limit: 5_000, done: 6 * 3600_000 };
 function fpArgs() {
     const a = ['detect', '--max-minutes', '60'];
     if (!S.get('FP_CREDITS')) a.push('--no-credits');
+    if (!S.get('FP_SEEDLESS')) a.push('--no-seedless');
     if (!S.get('CHAPTERS_ENABLED')) a.push('--no-chapters');
     if (!S.get('INTRODB_ENABLED')) a.push('--no-introdb');
     if (!S.get('MAP_RECAP')) a.push('--no-recap');
@@ -206,7 +208,7 @@ function fpStart() {
     clearTimeout(fp.timer); fp.timer = null;
     if (fp.child) return;
     if (!S.get('FP_ENABLED')) return fpSet('off');
-    if (!S.secretIsSet('infinidysk_password')) return fpSet('no-password');
+    if (S.get('FP_READ_SOURCE') === 'webdav' && !S.secretIsSet('infinidysk_password')) return fpSet('no-password');
     fpSet('running');
     const p = spawn('node', [FP_TOOL, ...fpArgs()], { stdio: ['ignore', 'pipe', 'pipe'], env: childEnv() });
     fp.child = p;
