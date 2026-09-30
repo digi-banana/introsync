@@ -73,16 +73,20 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const log = (...a) => console.log(new Date().toISOString().slice(0, 19).replace('T', ' '), ...a);
 function die(msg) { console.error(`tidb-sync: ${msg}`); process.exit(1); }
 
+// --commercials-only: just the Sports "Commercial N" chapters -> markers pass (the 15-min tick in main.mjs), so a game
+// gets Skip Commercial soon after it lands instead of at the daily run. No ledger items, lookups or fingerprints.
+const commercialsOnly = flag('commercials-only');
 const planOpts = () => ({
     policy: opt('policy', 'fill'),          // fill | prefer-tidb
     mapRecap: !flag('no-recap'),            // recap  -> extra intro marker ("Skip Intro" over the recap)
     mapPreview: !flag('no-preview'),        // preview -> credits marker (skipping it lands on Up Next)
     useChapters: !flag('no-chapters'),      // the file's own named chapters (Intro / Credits / Recap ...)
-    useIntrodb: !flag('no-introdb'),        // introdb.app fills segment types the others lack
-    useFingerprint: !flag('no-fingerprint'), // our own audio/video detection (fingerprint.mjs), last resort
-    useCommercials: !flag('no-commercials'), // "Commercial N" chapters (comskip -> comchap) -> commercial markers
+    useIntrodb: !commercialsOnly && !flag('no-introdb'),        // introdb.app fills segment types the others lack
+    useFingerprint: !commercialsOnly && !flag('no-fingerprint'), // our own audio/video detection (fingerprint.mjs), last resort
+    useCommercials: commercialsOnly || !flag('no-commercials'), // "Commercial N" chapters (comskip -> comchap) -> commercial markers
     commercialSections: opt('commercial-sections', 'Sports'),   // library sections (names or ids, comma-separated)
-    palGuard: !flag('no-pal-guard'),        // ignore community timestamps on PAL speed-up files (see buildPlan)
+    palGuard: !commercialsOnly && !flag('no-pal-guard'),        // ignore community timestamps on PAL speed-up files (see buildPlan)
+    commercialsOnly,
 });
 
 // ---------- databases ----------
@@ -481,7 +485,7 @@ function fingerprintBodies(plex) {
 
 function buildPlan(L, plex, opts) {
     const tagId = markerTagId(plex);
-    const rows = L.prepare(`
+    const rows = opts.commercialsOnly ? [] : L.prepare(`
         SELECT i.mid, i.kind, i.show_title, i.title, i.season, i.episode, t.body tbody, d.body ibody
         FROM items i
         LEFT JOIN lookups t ON t.lkey = i.lkey AND t.status = 200
@@ -782,7 +786,12 @@ async function preflight(what) {
             + '(MarkerEditorForPlex strongly recommends stopping PMS).');
         const n = await activeSessions();
         if (n === null && !flag('skip-session-check')) die('could not read Plex sessions; refusing (or pass --skip-session-check)');
-        if (n > 0) die(`${n} active Plex session(s); not writing now`);
+        if (n > 0) {
+            // --soft-sessions (the commercials tick): a stream is a normal reason to wait, not a failure. Same gate,
+            // just exit 0 so the next tick retries; never write under a reader.
+            if (flag('soft-sessions')) { log(`skip: ${n} active Plex session(s); not writing now, will retry`); process.exit(0); }
+            die(`${n} active Plex session(s); not writing now`);
+        }
     }
 }
 
@@ -797,6 +806,16 @@ async function takeBackup(plex) {
 }
 
 async function applyCmd() {
+    if (commercialsOnly) {
+        // Read-only look first: an empty tick must not touch sessions, backups or run history.
+        const L0 = openLedger(), p0 = openPlex(true);
+        const { plan: p } = buildPlan(L0, p0, planOpts());
+        p0.close(); L0.close();
+        if (!p.length) { log('apply: nothing to do (commercials-only)'); return; }
+        // The daily chain runs selftest as its own step before apply; this path has no chain, so check here.
+        selftest();
+        if (process.exitCode) die('selftest failed (Plex extra_data format drift?); not writing');
+    }
     await preflight('apply');
     const t0 = now();
     const L = openLedger();

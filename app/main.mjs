@@ -179,8 +179,55 @@ function scheduleNext() {
     next.setHours(h, m, 0, 0);
     if (next <= new Date()) next.setDate(next.getDate() + 1);
     nextRunAt = next;
-    schedTimer = setTimeout(() => { runChain('schedule'); scheduleNext(); }, next - new Date());
+    // A commercials tick can hold the lock for a minute or two; retry rather than lose the daily run.
+    const fire = (tries) => { if (!runChain('schedule') && tries > 0) setTimeout(() => fire(tries - 1), 120_000); };
+    schedTimer = setTimeout(() => { fire(15); scheduleNext(); }, next - new Date());
     log(`next run ${next.toString()}`);
+}
+
+// ---------- commercial markers soon after a recording lands (Sports DVR) ----------
+// Between daily runs, `apply --commercials-only` adds Skip Commercial markers to newly finished recordings. It shares
+// the one-at-a-time lock. The tool plans read-only first and exits before any backup when there's nothing to do, and
+// treats active streams as "retry next tick" (--soft-sessions, exit 0). Only runs that wrote or failed go in history.
+let comTimer = null;
+// What the last tick did, for the status page. 'waiting' is the state worth showing: markers are ready and held back
+// only because someone is streaming, which is exactly when the user wonders where they are.
+const com = { state: 'idle', since: Date.now(), sessions: 0 };
+const comSet = (state, sessions = 0) => {
+    if (com.state === state && com.sessions === sessions) return false;   // unchanged: caller stays quiet
+    com.state = state; com.sessions = sessions; com.since = Date.now();
+    return true;
+};
+function scheduleCommercials() {
+    clearInterval(comTimer); comTimer = null;
+    const min = Number(S.get('COMMERCIALS_INTERVAL_MIN')) || 0;
+    if (min > 0) comTimer = setInterval(commercialsTick, min * 60_000);
+    log(min > 0 ? `commercial markers: checking every ${min} min` : 'commercial markers: interval check off');
+}
+async function commercialsTick() {
+    if (running || !S.get('APPLY_ENABLED') || !S.get('COMMERCIALS_ENABLED')) return;
+    running = 'commercial markers';
+    let wrote = false;
+    try {
+        const args = ['apply', '--yes', '--live', '--commercials-only', '--soft-sessions',
+            '--keep-backups', String(S.get('KEEP_BACKUPS')), '--commercial-sections', S.get('COMMERCIALS_SECTIONS')];
+        const started = new Date().toISOString();
+        const r = await tool(args, { quiet: true });
+        const held = r.code === 0 ? /skip: (\d+) active Plex session/.exec(r.out) : null;
+        const idle = r.code === 0 && (held || /nothing to do \(commercials-only\)/.test(r.out));
+        if (held) {
+            // Log on change only, not every tick: an evening of streaming shouldn't fill the log.
+            if (comSet('waiting', Number(held[1]))) log(`commercial markers: ready, waiting for ${held[1]} active Plex session(s) to end`);
+        } else if (idle) comSet('idle');
+        if (!idle) {
+            wrote = true;
+            comSet(r.code === 0 ? 'applied' : 'failed');
+            appendSession({ trigger: 'interval', label: 'commercial markers', started, finished: new Date().toISOString(),
+                ok: r.code === 0, steps: [{ args: args.join(' '), code: r.code, tail: r.out.split('\n').slice(-12).join('\n') }] });
+            log(`commercial markers: ${r.code === 0 ? 'applied' : `failed (exit ${r.code})`}`);
+        }
+    } catch (e) { comSet('failed'); log('commercial markers failed:', e.message); }
+    finally { running = null; if (wrote) { invalidate(); refreshSubs(); } }
 }
 
 // ---------- fingerprint worker (method 4) ----------
@@ -461,7 +508,7 @@ async function ctx(url, req) {
     const snap = await snapshot();
     const m = url.searchParams.get('m');
     return {
-        authOn: canWrite(req), csrf: CSRF, running, nextRunAt, snap, settings: S.all(), fp: fpStatus(),
+        authOn: canWrite(req), csrf: CSRF, running, nextRunAt, snap, settings: S.all(), fp: fpStatus(), com: { ...com },
         secrets: Object.fromEntries(Object.keys(S.SECRETS).map(k => [k, S.secretIsSet(k)])),
         configKey: (() => { try { return fs.statSync(CONFIG_KEY).size > 0; } catch { return false; } })(),
         flash: m ? { msg: m.slice(0, 300), err: url.searchParams.get('e') === '1' } : null,
@@ -512,6 +559,7 @@ async function handle(req, res) {
         try {
             const changed = S.update(form);
             if (changed.includes('RUN_AT')) scheduleNext();
+            if (changed.includes('COMMERCIALS_INTERVAL_MIN')) scheduleCommercials();
             // Fingerprint on/off applies now; its other options apply from its next round (within the hour).
             if (changed.includes('FP_ENABLED')) { if (S.get('FP_ENABLED')) fpStart(); else fpStop(); }
             invalidate();
@@ -559,6 +607,15 @@ createServer((req, res) => {
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { log(`${sig}: exiting`); fp.child?.kill('SIGTERM'); process.exit(0); });
 
 scheduleNext();
+scheduleCommercials();
+// setInterval only fires after the first interval, so a restart would leave a recording unmarked for that long.
+// One catch-up tick 90 s in, once the web UI and the ledger have settled; it no-ops when there's nothing to do.
+// An idle tick is otherwise silent (no log, no history, no run row), so say it happened — once per start, not per tick.
+setTimeout(() => {
+    if (!(Number(S.get('COMMERCIALS_INTERVAL_MIN')) > 0)) return;
+    log('commercial markers: startup check');
+    commercialsTick();
+}, 90_000);
 setTimeout(refreshSubs, 20_000);
 if (S.get('RUN_ON_START')) setTimeout(() => runChain('start'), 15_000);
 setTimeout(fpStart, 30_000);

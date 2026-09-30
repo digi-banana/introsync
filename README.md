@@ -330,3 +330,25 @@ season follows the normal cheap path.
 
 **Cost:** two reads of the opening minutes per season and release, once (window adapts to bitrate, ~180 MB each).
 Across the ~2,000 unseeded seasons that is a few hundred GB of Usenet, spread over the worker's rounds.
+
+## Commercial markers without waiting for the daily run (`COMMERCIALS_INTERVAL_MIN`, default 15), added 2026-09-29
+A game that finishes at 20:30 shouldn't wait until 07:30 for its Skip Commercial markers. Between daily runs,
+`apply --commercials-only` looks for recordings that have comskip chapters but no markers yet.
+
+- **Scope only.** `--commercials-only` turns off TheIntroDB, introdb.app, fingerprint detection and the PAL guard,
+  forces commercials on, and skips the ledger rows. It is the same apply, with the same backup, undo log and
+  provenance; nothing new writes to Plex.
+- **An idle tick costs nothing.** It builds the plan against a read-only Plex handle first and returns before
+  `preflight` and before the backup when there is nothing to do. Without that ordering, a 15-minute cadence would
+  copy `library.db` 96 times a day.
+- **A stream postpones it, it never overrides one.** The session check is unchanged — the tool still refuses to write
+  while anyone is streaming. `--soft-sessions` only makes that a clean exit instead of a failure, so the next tick
+  retries; the status page says "ready, waiting for N stream(s) to end" while that is true. "Could not read Plex
+  sessions" still refuses outright.
+- **Quiet by default.** Only ticks that wrote or failed appear in the run history, and the waiting line is logged
+  once per change, not once per tick. One catch-up tick runs 90 s after start, since `setInterval` alone would leave
+  a recording unmarked for a full interval after a restart.
+- **It shares the one-at-a-time lock** with the daily chain, which now retries every 2 min (up to 15 times) if a tick
+  holds the lock at `RUN_AT`.
+- **Live results:** two games marked end to end by the interval, 26 and 11 breaks, 34 s and 32 s per run. The first
+  waited out an active stream and wrote at the following tick.

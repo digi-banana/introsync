@@ -33,6 +33,8 @@ export const SCHEMA = [
       help: 'Recordings whose chapters are named "Commercial 1, 2, …" (comskip via Unmanic comchap) get Plex "Skip Commercial" markers. A break at the very start or end is skipped (the trimmed padding), and Plex\'s own commercial markers are never replaced.' },
     { key: 'COMMERCIALS_SECTIONS', type: 'text', def: 'Sports', pattern: /^[^,]{1,60}(,[^,]{1,60}){0,9}$/, group: 'Sources', label: 'Libraries for commercial markers',
       help: 'Library names or ids, comma-separated.' },
+    { key: 'COMMERCIALS_INTERVAL_MIN', type: 'int', def: 15, min: 0, max: 1440, group: 'Sources', label: 'Check for new recordings every (minutes)',
+      help: 'Between daily runs, add commercial markers to newly finished recordings. Only commercial markers; waits while anyone is watching; an empty check changes nothing. 0 = off (daily run only). Needs writing and commercial markers on.' },
     { key: 'MAP_RECAP', type: 'bool', def: true, group: 'Sources', label: 'Recaps become Skip Intro',
       help: 'Plex has no recap marker, so a recap is added as an extra intro marker.' },
     { key: 'MAP_PREVIEW', type: 'bool', def: true, group: 'Sources', label: '"Next time on" previews become credits',

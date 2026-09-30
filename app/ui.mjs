@@ -77,7 +77,7 @@ export function statusPage(c) {
     return layout({ title: 'Status', active: '/', authOn: c.authOn, running: c.running, flash: c.flash, body: `
 <p class="sub">Intro &amp; credits markers for Plex from TheIntroDB, then the files' own chapter names, then introdb.app, then IntroSync's own fingerprint detection.
 ${c.running ? '' : `Next scheduled run: <b>${esc(c.nextRunAt?.toLocaleString('en-US') ?? '–')}</b>.`}</p>
-<div class="card inline">${chips(c.settings)}
+<div class="card inline">${chips(c.settings, c.com)}
 ${form('/run', c.csrf, `<button${dis(c)}>Run now</button>`, { confirm: c.settings.APPLY_ENABLED ? 'Run the full chain now? Writing is ON, so markers will be written into Plex.' : 'Run lookups and plan now? (Writing is off.)' })}
 <span class="muted">${c.settings.APPLY_ENABLED ? 'Each run writes markers into Plex.' : 'Runs look up and plan only (writing is off).'}</span></div>
 ${usageCard(c)}
@@ -91,10 +91,15 @@ ${fingerprintCard(c)}
 <p class="muted" style="margin:8px 0 0"><a href="/runs">Full history and undo →</a></p></div>` });
 }
 
-function chips(s) {
+function chips(s, com) {
+    // The commercials chip doubles as the only place the interval tick is visible: say so when markers are ready but
+    // held back by a stream, since that's the state someone waiting on a just-finished recording is looking for.
+    const commercials = !s.COMMERCIALS_ENABLED ? 'off'
+        : com?.state === 'waiting' ? `${s.COMMERCIALS_SECTIONS} — ready, waiting for ${com.sessions} stream(s) to end`
+        : s.COMMERCIALS_SECTIONS;
     const pills = [['Writing', s.APPLY_ENABLED ? 'on' : 'off', s.APPLY_ENABLED], ['TheIntroDB', s.TIDB_ENABLED ? 'on' : 'off'],
                    ['chapters', s.CHAPTERS_ENABLED ? 'on' : 'off'], ['introdb.app', s.INTRODB_ENABLED ? 'on' : 'off'],
-                   ['fingerprint', s.FP_ENABLED ? 'on' : 'off'], ['commercials', s.COMMERCIALS_ENABLED ? s.COMMERCIALS_SECTIONS : 'off'], ['PAL guard', s.PAL_GUARD ? 'on' : 'off'], ['auto-submit', [s.SUBMIT_TIDB_AUTO ? 'TheIntroDB' : null, s.SUBMIT_INTRODB_AUTO ? 'introdb.app' : null].filter(Boolean).join(' + ') || 'off'], ['policy', s.POLICY], ['daily', s.RUN_AT]];
+                   ['fingerprint', s.FP_ENABLED ? 'on' : 'off'], ['commercials', commercials, com?.state === 'waiting'], ['PAL guard', s.PAL_GUARD ? 'on' : 'off'], ['auto-submit', [s.SUBMIT_TIDB_AUTO ? 'TheIntroDB' : null, s.SUBMIT_INTRODB_AUTO ? 'introdb.app' : null].filter(Boolean).join(' + ') || 'off'], ['policy', s.POLICY], ['daily', s.RUN_AT]];
     return pills.map(([k, v, w]) => `<span class="pill${w ? ' warn' : ''}">${esc(k)}: ${esc(v)}</span>`).join('');
 }
 
