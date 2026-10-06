@@ -112,8 +112,10 @@ function openLedger() {
             submitted_at INTEGER, PRIMARY KEY(mid, segment));`);
     // introdb.app is keyed on IMDb ids: items.ikey is its lookup key (lookups rows prefixed "idb:").
     // applied.source / submissions.origin record provenance (NULL applied.source = pre-introdb run = tidb).
+    // items.watched_at: when the item's SHOW was last watched, captured by inventory (fetch has no Plex access).
+    // buildQueue puts those shows at the front, so what someone is watching gets markers within a day.
     for (const [table, col] of [['items', 'imdb TEXT'], ['items', 'ikey TEXT'], ['applied', 'source TEXT'],
-                                ['submissions', "origin TEXT DEFAULT 'plex'"]]) {
+                                ['submissions', "origin TEXT DEFAULT 'plex'"], ['items', 'watched_at INTEGER']]) {
         try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${col}`); } catch { /* already there */ }
     }
     db.exec('CREATE INDEX IF NOT EXISTS items_ikey ON items(ikey)');
@@ -166,6 +168,27 @@ const singleTmdb = (idExpr) => `(SELECT count(*) FROM taggings x JOIN tags t ON 
     WHERE x.metadata_item_id = ${idExpr} AND t.tag_type = 314 AND t.tag LIKE 'tmdb://%') = 1`;
 
 // ---------- inventory ----------
+// Shows watched since `since`, as show metadata_item id -> when. Two signals, whichever is later:
+// finished/scrobbled plays (metadata_item_views, joined show-ward on grandparent_guid) and anything left
+// part-watched (metadata_item_settings.view_offset > 0, i.e. Plex's Continue Watching). Every account counts:
+// markers help whoever plays the episode next, and this only decides what gets looked up first.
+function watchedShows(plex, since) {
+    const at = new Map();
+    const note = (rows) => { for (const r of rows) if (r.mid && r.at > (at.get(r.mid) ?? 0)) at.set(r.mid, r.at); };
+    note(plex.prepare(`
+        SELECT sh.id mid, max(v.viewed_at) at
+        FROM metadata_item_views v
+        JOIN metadata_items sh ON sh.guid = v.grandparent_guid AND sh.metadata_type = 2
+        WHERE v.metadata_type = 4 AND v.viewed_at >= ? GROUP BY sh.id`).all(since));
+    note(plex.prepare(`
+        SELECT sh.id mid, max(coalesce(s.last_viewed_at, s.updated_at)) at
+        FROM metadata_item_settings s
+        JOIN metadata_items e ON e.guid = s.guid AND e.metadata_type = 4
+        JOIN metadata_items se ON se.id = e.parent_id
+        JOIN metadata_items sh ON sh.id = se.parent_id
+        WHERE s.view_offset > 0 AND coalesce(s.last_viewed_at, s.updated_at) >= ? GROUP BY sh.id`).all(since));
+    return at;
+}
 function inventory() {
     const t = now();
     const plex = openPlex(true);
@@ -173,13 +196,15 @@ function inventory() {
                   JOIN tags g ON g.id = tg.tag_id AND g.tag_type = 314 AND g.tag LIKE 'tmdb://%'`;
     const eps = plex.prepare(`
         SELECT e.id mid, 'ep' kind, CAST(substr(g.tag, 8) AS INTEGER) tmdb, se."index" season, e."index" episode,
-               ${fileDur('e.id')} duration_ms, sh.title show_title, e.title title, ${imdbOf('sh.id')} imdb
+               ${fileDur('e.id')} duration_ms, sh.title show_title, e.title title, ${imdbOf('sh.id')} imdb,
+               sh.id show_mid
         FROM metadata_items e
         JOIN metadata_items se ON se.id = e.parent_id
         JOIN metadata_items sh ON sh.id = se.parent_id
         ${guid.replace('%ID%', 'sh.id')}
         WHERE e.metadata_type = 4 AND e.deleted_at IS NULL AND e."index" >= 1 AND ${singleTmdb('sh.id')}
           AND se."index" BETWEEN 1 AND 999   -- year-numbered seasons (e.g. 1977) are rejected by TIDB`).all();
+    const watched = watchedShows(plex, t - Number(opt('watched-days', 30)) * DAY);
     const movies = plex.prepare(`
         SELECT m.id mid, 'movie' kind, CAST(substr(g.tag, 8) AS INTEGER) tmdb, NULL season, NULL episode,
                ${fileDur('m.id')} duration_ms, NULL show_title, m.title title, ${imdbOf('m.id')} imdb
@@ -190,22 +215,27 @@ function inventory() {
 
     const L = openLedger();
     const up = L.prepare(`
-        INSERT INTO items(mid, kind, tmdb, season, episode, duration_ms, show_title, title, lkey, imdb, ikey, seen_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO items(mid, kind, tmdb, season, episode, duration_ms, show_title, title, lkey, imdb, ikey, seen_at,
+                          watched_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(mid) DO UPDATE SET kind=excluded.kind, tmdb=excluded.tmdb, season=excluded.season,
             episode=excluded.episode, duration_ms=excluded.duration_ms, show_title=excluded.show_title,
-            title=excluded.title, lkey=excluded.lkey, imdb=excluded.imdb, ikey=excluded.ikey, seen_at=excluded.seen_at`);
-    let n = 0;
+            title=excluded.title, lkey=excluded.lkey, imdb=excluded.imdb, ikey=excluded.ikey, seen_at=excluded.seen_at,
+            watched_at=excluded.watched_at`);
+    let n = 0, boosted = 0;
     L.exec('BEGIN');
     for (const r of [...eps, ...movies]) {
         if (!(r.tmdb > 0)) continue;
+        const w = watched.get(r.show_mid) ?? null;   // null for movies, and for shows nobody watched lately
+        if (w) boosted++;
         up.run(r.mid, r.kind, r.tmdb, r.season, r.episode, r.duration_ms, r.show_title, r.title, lkeyOf(r),
-               r.imdb, ikeyOf(r), t);
+               r.imdb, ikeyOf(r), t, w);
         n++;
     }
     const gone = L.prepare('DELETE FROM items WHERE seen_at < ?').run(t).changes;
     L.exec('COMMIT');
-    const summary = { episodes: eps.length, movies: movies.length, upserted: n, removed: Number(gone) };
+    const summary = { episodes: eps.length, movies: movies.length, upserted: n, removed: Number(gone),
+                      watchedShows: watched.size, watchedEpisodes: boosted };
     recordRun(L, 'inventory', t, summary);
     log('inventory', summary);
 }
@@ -220,7 +250,7 @@ function readKey() {
 //   unfetched episodes of shows that already have data; then movies (low hit rate); then refreshes.
 function buildQueue(L, t, keyCol) {
     const items = L.prepare(`SELECT ${keyCol} lkey, kind, tmdb, imdb, season, episode, max(duration_ms) duration_ms,
-                                    min(coalesce(show_title, title)) label
+                                    min(coalesce(show_title, title)) label, max(watched_at) watched_at
                              FROM items WHERE ${keyCol} IS NOT NULL GROUP BY ${keyCol}`).all();
     const lk = new Map(L.prepare('SELECT lkey, status, next_at FROM lookups').all().map(r => [r.lkey, r]));
     const fresh = (k) => !lk.has(k);
@@ -255,8 +285,28 @@ function buildQueue(L, t, keyCol) {
         if (i < probeNew.length) mixed.push(probeNew[i]);
         if (i < warmNew.length) mixed.push(warmNew[i]);
     }
-    return { queue: [...mixed, ...movieNew, ...refresh],
-             counts: { probeNew: probeNew.length, warmNew: warmNew.length, movieNew: movieNew.length, refresh: refresh.length } };
+    const [front, rest] = watchedFirst(mixed);
+    return { queue: [...front, ...rest, ...movieNew, ...refresh],
+             counts: { watched: front.length, probeNew: probeNew.length, warmNew: warmNew.length,
+                       movieNew: movieNew.length, refresh: refresh.length } };
+}
+
+// Episodes of recently watched shows go to the front (items.watched_at, set by inventory), newest view first.
+// Round-robin ACROSS those shows rather than finishing one before starting the next: a 790-episode back
+// catalogue someone dipped into would otherwise eat a whole day's quota ahead of the 17 episodes of the show
+// they're actually working through. Order within each show is left exactly as it was (probes, then warm).
+function watchedFirst(queue) {
+    const byShow = new Map();
+    const rest = [];
+    for (const q of queue) {
+        if (!(q.watched_at > 0)) { rest.push(q); continue; }
+        if (!byShow.has(q.tmdb)) byShow.set(q.tmdb, []);
+        byShow.get(q.tmdb).push(q);
+    }
+    const shows = [...byShow.values()].sort((a, b) => b[0].watched_at - a[0].watched_at);
+    const front = [];
+    for (let i = 0; shows.some(s => i < s.length); i++) for (const s of shows) if (i < s.length) front.push(s[i]);
+    return [front, rest];
 }
 
 async function tidbGet(q, key) {
@@ -312,6 +362,10 @@ async function fetchCmd() {
     const key = source === 'tidb' ? readKey() : null;
     const { queue, counts } = buildQueue(L, t0, src.keyCol);
     log(`fetch ${source}: queue ${queue.length}`, counts, `budget ${budget}`, source === 'tidb' ? (key ? '(api key)' : '(anonymous)') : '');
+    if (counts.watched) {   // say which shows got the front of the queue, so the daily log shows where the quota went
+        const names = [...new Set(queue.slice(0, counts.watched).map(q => q.label))];
+        log(`  watched first: ${names.slice(0, 6).join(', ')}${names.length > 6 ? ` +${names.length - 6} more` : ''}`);
+    }
 
     const prev = L.prepare('SELECT status FROM lookups WHERE lkey=?');
     const put = L.prepare(`

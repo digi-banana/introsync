@@ -352,3 +352,24 @@ A game that finishes at 20:30 shouldn't wait until 07:30 for its Skip Commercial
   holds the lock at `RUN_AT`.
 - **Live results:** two games marked end to end by the interval, 26 and 11 breaks, 34 s and 32 s per run. The first
   waited out an active stream and wrote at the following tick.
+
+## What you're watching gets looked up first (added 2026-10-05)
+The lookup queue is far longer than a day's API quota — 22.9k of 40.6k items had never been looked up when this
+went in, against ~985 TheIntroDB and 1000 introdb.app requests a day. The queue's order therefore decides what
+gets markers this week and what waits a month, and it used to ignore what anyone was actually watching: a show
+someone started tonight sat wherever its lookup key happened to fall.
+
+- **Signal, captured by `inventory`.** `fetch` talks only to the APIs and never opens Plex, so `inventory` records
+  `items.watched_at` — when the item's *show* was last watched — while it has the Plex database open. Two sources,
+  whichever is later: scrobbled plays (`metadata_item_views`, joined show-ward on `grandparent_guid`) and anything
+  left part-watched (`metadata_item_settings.view_offset > 0`, Plex's Continue Watching). Window `--watched-days`,
+  default 30. Every account counts: markers help whoever plays the episode next, and this only sets priority.
+- **Round-robin across watched shows, newest view first.** Finishing one show before starting the next would let a
+  790-episode back catalogue someone dipped into eat a whole day's quota ahead of the 17 episodes of the show they
+  are working through. Order *within* a show is unchanged (probes, then warm episodes).
+- **Nothing else changes.** Movies and refreshes stay behind new episodes, and a "cold" show — one whose probes came
+  back empty — still gets nothing, watched or not. Boosting can only reorder work that was already queued.
+- **The daily log says where the quota went:** `watched first: American Rust, Prehistoric Planet`.
+- **Measured on the live ledger:** the first pending episode of a show being watched sat at queue index 4,170 of
+  8,271 (4-5 days out at the daily budget). After: that show's 17 pending episodes occupy indexes 0-29, so they are
+  all looked up on the next daily run.
