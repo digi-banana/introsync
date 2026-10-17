@@ -237,8 +237,14 @@ export function planPage(c) {
     const ch = (it) => Object.entries(it.changes ?? {}).filter(([, v]) => v.action && v.action !== 'keep').map(([k, v]) =>
         `<div><b>${esc(k)}</b> ${esc(v.action)}: ${(v.add ?? []).map(m => `${t(m.start)}–${t(m.end)} ${badge(String(m.src ?? '').split(':')[0] || 'mixed')}`).join(' ')}${(v.remove ?? []).length ? ` <span class="muted">(−${v.remove.length})</span>` : ''}</div>`).join('');
     const changes = (st.add ?? 0) + (st.update ?? 0) + (st.reapply ?? 0) + (st.retract ?? 0) + (st.replacePlex ?? 0);
+    // Changes are counted per type, so an item needing both an intro and a credits marker counts twice. Say both
+    // numbers: the mismatch is what made a finished plan look like a backlog.
+    const planItems = (p?.plan ?? []).filter(it => Object.values(it.changes ?? {}).some(v => v.action && v.action !== 'keep')).length;
+    const ps = c.planStatus;
+    const written = ps?.state === 'applied';
     return layout({ title: 'Plan & apply', active: '/plan', authOn: c.authOn, running: c.running, flash: c.flash, body: `
 <div class="card"><h2>Latest plan</h2>${p ? `<p class="muted" style="margin:0 0 8px">${esc(c.planFile)} · built ${esc(c.planAge)}</p>
+${applyState(c, ps, changes, planItems)}
 <div class="row"><div><div class="big">${n(st.add)}</div>to add</div><div><div class="big">${n(st.update)}</div>to update</div><div><div class="big">${n(st.reapply)}</div>to re-apply</div>
 <div><div class="big">${n(st.retract)}</div>to retract</div><div><div class="big">${n(st.alreadyCurrent)}</div>already current</div><div><div class="big">${n(st.keptPlex)}</div>Plex's own kept</div></div>
 <p class="muted" style="margin:10px 0 0">New markers by source: ${Object.entries(st.bySource ?? {}).map(([k, v]) => `${badge(k)} ${n(v)}`).join(' ')}</p>` : '<p class="muted">No plan yet.</p>'}</div>
@@ -246,10 +252,39 @@ export function planPage(c) {
 ${form('/apply', c.csrf, `<label class="inline" style="font-weight:400"><input type="checkbox" name="ok" value="1" required>I understand this writes into Plex's database</label>
 <button class="danger"${dis(c)}>Apply now</button>`, { confirm: 'Write the planned markers into Plex now? A full database backup and an undo log are made first, and it refuses if anyone is streaming.' })}
 <span class="muted">Apply builds a fresh plan with the current settings (same as the preview if nothing changed), runs the format selftest, and only writes with no one streaming.</span></div>
-<div class="card"><h2>Changes ${changes ? `(${n(changes)} planned)` : ''}</h2>
+<div class="card"><h2>Changes ${changes ? `(${n(changes)} ${written ? 'applied' : 'planned'})` : ''}</h2>
+${changes ? `<p class="muted" style="margin:0 0 8px">${n(changes)} ${written ? 'changes written' : 'changes'} across ${n(planItems)} items${changes !== planItems ? ', since an episode can need both an intro and a credits marker' : ''}.</p>` : ''}
 <form method="get" action="/plan" class="inline" style="margin-bottom:8px"><select name="a"><option value="">All actions</option>${actions.map(a => `<option${a === act ? ' selected' : ''}>${a}</option>`).join('')}</select><button class="ghost">Filter</button></form>
 ${rows.length ? `<table><thead><tr><th>item</th><th class="l">changes</th></tr></thead><tbody>${rows.slice(0, 300).map(it => `<tr><td class="l">${esc(it.label)}</td><td class="l">${ch(it)}</td></tr>`).join('')}</tbody></table>
 ${rows.length > 300 ? `<p class="muted">Showing 300 of ${n(rows.length)}.</p>` : ''}` : '<p class="muted">Nothing to change.</p>'}</div>` });
+}
+
+// Whether the plan on screen is still waiting or has already been written into Plex. Without this the page shows a
+// finished plan's counts and reads like a backlog — which is exactly how it was misread.
+function applyState(c, ps, changes, planItems) {
+    if (!ps) return '';
+    const box = (cls, html) => `<p class="${cls}" style="margin:0 0 10px">${html}</p>`;
+    if (ps.state === 'applied') {
+        const d = ps.done ?? {};
+        const items = d.items ?? planItems;
+        const bits = [];
+        if (items) bits.push(`${n(items)} item${items === 1 ? '' : 's'}`);
+        if (d.inserted) bits.push(`${n(d.inserted)} marker${d.inserted === 1 ? '' : 's'} written`);
+        if (d.deleted) bits.push(`${n(d.deleted)} removed`);
+        return box('ok', `<b>Applied${ps.at ? ` ${esc(when(ps.at))}` : ''}</b>${bits.length ? ` — ${bits.join(', ')}` : ''}. `
+            + `<span class="muted">These markers are in Plex now${ps.undoPath ? ', and this is the run <a href="/runs">undo</a> steps back to' : ''}.</span>`);
+    }
+    if (ps.state === 'refused') {
+        return box('warn', `<b>Not written yet</b> — the apply after this plan stopped${ps.at ? ` at ${esc(when(ps.at))}` : ''}: ${esc(ps.reason)}. `
+            + `<span class="muted">Nothing was changed in Plex. The next scheduled run${c.nextRunAt ? ` (${esc(c.nextRunAt.toLocaleString('en-US'))})` : ''} tries again, or use Apply now below.</span>`);
+    }
+    if (ps.state === 'off') {
+        return box('warn', `<b>${changes ? `${n(changes)} changes waiting` : 'Nothing waiting'}</b> — writing is off, so plans are previews only. `
+            + `<span class="muted">Turn on "${esc('Write the planned markers into Plex')}" in <a href="/settings">Settings</a>, or use Apply now below.</span>`);
+    }
+    return box('muted', changes
+        ? `<b>${n(changes)} changes not written yet.</b> The next scheduled run${c.nextRunAt ? ` (${esc(c.nextRunAt.toLocaleString('en-US'))})` : ''} applies them, or use Apply now below.`
+        : 'Nothing to write: Plex already matches this plan.');
 }
 
 // ---------------- runs & undo ----------------

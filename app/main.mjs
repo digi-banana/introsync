@@ -439,6 +439,46 @@ function latestPlan() {
     return v;
 }
 
+// Has the newest plan actually been written into Plex? The page used to show a plan's counts with nothing saying
+// whether they were still waiting, so an applied plan looked stuck. An apply only gets a `runs` row once it has
+// written something (recordRun is the last thing applyCmd does), so a refused apply has to come from the chain's
+// own step log instead — that's where "1 active Plex session(s)" or a failed selftest ends up.
+function planStatus(planMtimeMs) {
+    const built = Math.floor(planMtimeMs / 1000);
+    const db = ro(LEDGER);
+    let row = null;
+    if (db) {
+        try {
+            row = db.prepare(`SELECT started_at s, finished_at f, summary FROM runs
+                              WHERE cmd = 'apply' AND started_at >= ? ORDER BY started_at DESC, id DESC LIMIT 1`).get(built);
+        } catch { }
+        db.close();
+    }
+    if (row) {
+        let sm = {};
+        try { sm = JSON.parse(row.summary); } catch { }
+        return { state: 'applied', at: row.f, done: sm.done ?? {}, undoPath: sm.undoPath ?? null };   // `at` in seconds, like the ledger
+    }
+    // No apply has written since this plan was built: was one refused, or has none run yet?
+    let refused = null;
+    try {
+        for (const line of fs.readFileSync(SESSIONS, 'utf8').trim().split('\n')) {
+            let s; try { s = JSON.parse(line); } catch { continue; }
+            const at = Date.parse(s.finished ?? s.started ?? '');
+            if (!(at >= planMtimeMs)) continue;
+            for (const st of s.steps ?? []) {
+                if (!/(^|\s)apply(\s|$)/.test(st.args ?? '') || st.code === 0) continue;
+                // The tool's own last complaint reads better than an exit code.
+                const why = String(st.tail ?? '').split('\n').map(l => /tidb-sync: (.+)$/.exec(l.trim())?.[1])
+                    .filter(Boolean).pop();
+                refused = { at: Math.floor(at / 1000), reason: why || `exit ${st.code}` };
+            }
+        }
+    } catch { }
+    if (refused) return { state: 'refused', ...refused };
+    return { state: S.get('APPLY_ENABLED') ? 'pending' : 'off' };
+}
+
 const UNDO_RX = /^undo-(.+)\.jsonl(\.undone)?$/;
 function undoLogs() {
     let files = [];
@@ -536,7 +576,8 @@ async function handle(req, res) {
         if (p === '/plan') {
             const c = await ctx(url, req);
             const lp = latestPlan();
-            return send(res, 200, UI.planPage({ ...c, plan: lp?.data, planFile: lp?.file, planAge: lp ? UI.ago(lp.mtime / 1000) : '', action: url.searchParams.get('a') ?? '' }));
+            return send(res, 200, UI.planPage({ ...c, plan: lp?.data, planFile: lp?.file, planAge: lp ? UI.ago(lp.mtime / 1000) : '',
+                planStatus: lp ? planStatus(lp.mtime) : null, action: url.searchParams.get('a') ?? '' }));
         }
         if (p === '/runs') { const c = await ctx(url, req); return send(res, 200, UI.runsPage({ ...c, history: runHistory(80), undoLogs: undoLogs() })); }
         if (p === '/submit') {

@@ -373,3 +373,21 @@ someone started tonight sat wherever its lookup key happened to fall.
 - **Measured on the live ledger:** the first pending episode of a show being watched sat at queue index 4,170 of
   8,271 (4-5 days out at the daily budget). After: that show's 17 pending episodes occupy indexes 0-29, so they are
   all looked up on the next daily run.
+
+## Is the plan still waiting, or already written? (added 2026-10-13)
+The Plan & apply page showed the latest plan's counts with nothing saying whether they had been written,
+so a plan the daily chain had already applied read like a stuck backlog. The "Latest plan" card now
+carries a status line, and the Changes header says `applied` rather than `planned` once written.
+
+- **Applied** — an `apply` run finished after this plan file was built: *"Applied 07:46 — 203 items, 268
+  markers written, 75 removed"*, with a pointer to the run that undo steps back to.
+- **Pending** — no apply since the plan: says when the next scheduled run will write it.
+- **Not written yet** — the apply after the plan stopped, showing the tool's own reason (for example
+  "1 active Plex session(s); not writing now"), and that nothing was changed in Plex.
+- **Writing is off** — plans are previews only, with a link to the setting.
+- Matching is by comparing the plan file's build time against the newest `runs` row with `cmd='apply'`.
+  A refused apply leaves no `runs` row at all (`recordRun` is the last thing `applyCmd` does), so that
+  case is read from the chain's own step log instead.
+- The header also gives both numbers — `260 changes written across 203 items` — because changes are
+  counted per type and an episode can need both an intro and a credits marker. That mismatch is what made
+  a finished plan look like a backlog.
